@@ -1,4 +1,4 @@
-name: Publish deepiri-node-base
+name: Publish deepiri-base
 
 on:
   push:
@@ -48,6 +48,6 @@ jobs:
           file: ./Dockerfile
           push: true
           build-args: BASE_IMAGE=${{ matrix.base }}
-          tags: ghcr.io/team-deepiri/deepiri-node-base:${{ matrix.tag }}
+          tags: ghcr.io/team-deepiri/deepiri-base:${{ matrix.tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

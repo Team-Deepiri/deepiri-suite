@@ -17,6 +17,7 @@ load_k8s_yaml() {
     
     # Extract from data: section (ConfigMaps)
     if grep -q "^data:" "$yaml_file" 2>/dev/null; then
+        temp_file="$(mktemp)"
         awk '/^data:/{flag=1; next} /^[^ ]/{flag=0} flag && /^  [A-Z_][A-Z0-9_]*:/ {
             key = $1
             gsub(/^  /, "", key)
@@ -32,13 +33,16 @@ load_k8s_yaml() {
                 }
             }
             print "export " key "=\"" value "\""
-        }' "$yaml_file" | while IFS= read -r line || [ -n "$line" ]; do
+        }' "$yaml_file" > "$temp_file"
+        while IFS= read -r line || [ -n "$line" ]; do
             [ -n "$line" ] && eval "$line" 2>/dev/null || true
-        done
+        done < "$temp_file"
+        rm -f "$temp_file"
     fi
     
     # Extract from stringData: section (Secrets)
     if grep -q "^stringData:" "$yaml_file" 2>/dev/null; then
+        temp_file="$(mktemp)"
         awk '/^stringData:/{flag=1; next} /^[^ ]/{flag=0} flag && /^  [A-Z_][A-Z0-9_]*:/ {
             key = $1
             gsub(/^  /, "", key)
@@ -54,9 +58,11 @@ load_k8s_yaml() {
                 }
             }
             print "export " key "=\"" value "\""
-        }' "$yaml_file" | while IFS= read -r line || [ -n "$line" ]; do
+        }' "$yaml_file" > "$temp_file"
+        while IFS= read -r line || [ -n "$line" ]; do
             [ -n "$line" ] && eval "$line" 2>/dev/null || true
-        done
+        done < "$temp_file"
+        rm -f "$temp_file"
     fi
 }
 
@@ -82,4 +88,3 @@ if [ -d "$K8S_SECRETS_DIR" ]; then
         [ -f "$secret" ] && load_k8s_yaml "$secret"
     done
 fi
-
