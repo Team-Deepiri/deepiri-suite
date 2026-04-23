@@ -1,0 +1,13 @@
+# CodeQL configuration for deepiri-base
+# Exclude build artifacts, logs, and dependency directories
+
+paths-ignore:
+  - '**/node_modules/**'
+  - '**/dist/**'
+  - '**/build/**'
+  - '**/coverage/**'
+  - '**/logs/**'
+  - '**/.git/**'
+  - '**/.github/**'
+  - '**/README.md'
+  - '**/LICENSE'
