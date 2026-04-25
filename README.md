@@ -1,29 +1,29 @@
-# deepiri-base
+# deepiri-toolchain
 
-Shared Node.js Docker base for Team Deepiri services: `curl`, `dumb-init`, `bash`, OpenSSL (Alpine), K8s env loader scripts, and a non-root `nodejs` user (uid/gid 1001).
+Shared Deepiri toolchain repository. Today it publishes the Node.js Docker base for Team Deepiri services: `curl`, `dumb-init`, `bash`, OpenSSL (Alpine), K8s env loader scripts, and a non-root `nodejs` user (uid/gid 1001).
 
 Images are published to **GitHub Container Registry**:
 
 | Tag | Base | Typical services |
 |-----|------|------------------|
-| `ghcr.io/team-deepiri/deepiri-base:18-alpine` | `node:18-alpine` | api-gateway, external-bridge, challenge, engagement, notification, platform-analytics, realtime |
-| `ghcr.io/team-deepiri/deepiri-base:18-slim` | `node:18-slim` | auth-service, task-orchestrator |
-| `ghcr.io/team-deepiri/deepiri-base:20-alpine` | `node:20-alpine` | language-intelligence, messaging |
+| `ghcr.io/team-deepiri/deepiri-toolchain:18-alpine` | `node:18-alpine` | api-gateway, external-bridge, challenge, engagement, notification, platform-analytics, realtime |
+| `ghcr.io/team-deepiri/deepiri-toolchain:18-slim` | `node:18-slim` | auth-service, task-orchestrator |
+| `ghcr.io/team-deepiri/deepiri-toolchain:20-alpine` | `node:20-alpine` | language-intelligence, messaging |
 
 ## First-time setup (GitHub)
 
-1. Create an empty repository on GitHub: `Team-Deepiri/deepiri-base`.
+1. Create an empty repository on GitHub: `Team-Deepiri/deepiri-toolchain`.
 2. Push this directory to `main` (see [REMOTE_SETUP.md](REMOTE_SETUP.md)).
-3. Confirm the **Publish deepiri-base** workflow runs and all three tags appear under the org’s GitHub Packages.
+3. Confirm the **Publish deepiri-toolchain** workflow runs and all three tags appear under the org’s GitHub Packages.
 
-**Important:** Publish this repository and verify images exist **before** merging service Dockerfiles that use `FROM ghcr.io/team-deepiri/deepiri-base:…`.
+**Important:** Publish this repository and verify images exist **before** merging service Dockerfiles that use `FROM ghcr.io/team-deepiri/deepiri-toolchain:…`.
 
 ## Local build
 
 From the repository root:
 
 ```bash
-docker build --build-arg BASE_IMAGE=node:18-alpine -t ghcr.io/team-deepiri/deepiri-base:18-alpine .
+docker build --build-arg BASE_IMAGE=node:18-alpine -t ghcr.io/team-deepiri/deepiri-toolchain:18-alpine .
 ```
 
 ## Pulling the image (private package)
@@ -49,7 +49,7 @@ Source of truth for script content is this repo; sync from `deepiri-platform` `p
 Example:
 
 ```dockerfile
-FROM ghcr.io/team-deepiri/deepiri-base:18-alpine
+FROM ghcr.io/team-deepiri/deepiri-toolchain:18-alpine
 WORKDIR /app
 COPY package*.json ./
 # ... service-specific layers ...

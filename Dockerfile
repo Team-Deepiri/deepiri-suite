@@ -1,11 +1,11 @@
-# Deepiri Node.js base — published to ghcr.io/team-deepiri/deepiri-base
+# Deepiri Node.js base — published to ghcr.io/team-deepiri/deepiri-toolchain
 # Build from this repository root:
-#   docker build --build-arg BASE_IMAGE=node:18-alpine -t ghcr.io/team-deepiri/deepiri-base:18-alpine .
+#   docker build --build-arg BASE_IMAGE=node:18-alpine -t ghcr.io/team-deepiri/deepiri-toolchain:18-alpine .
 
 ARG BASE_IMAGE=node:18-alpine
 FROM ${BASE_IMAGE}
 
-LABEL org.opencontainers.image.source="https://github.com/Team-Deepiri/deepiri-base"
+LABEL org.opencontainers.image.source="https://github.com/Team-Deepiri/deepiri-toolchain"
 LABEL org.opencontainers.image.description="Deepiri Node runtime (dumb-init, bash, openssl on Alpine, K8s env scripts)"
 
 WORKDIR /app
