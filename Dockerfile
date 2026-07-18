@@ -19,6 +19,22 @@ RUN set -eux; \
       rm -rf /var/lib/apt/lists/*; \
     fi
 
+
+# Bedd runtime (Bun-style) — install both; entrypoint picks musl vs gnu
+ARG BEDD_IMAGE=ghcr.io/team-deepiri/bedd:0.6
+RUN mkdir -p /usr/local/lib/bedd
+COPY --from=${BEDD_IMAGE} /usr/local/bin/bedd /usr/local/lib/bedd/bedd-gnu
+COPY --from=${BEDD_IMAGE} /opt/bedd/bedd-musl /usr/local/lib/bedd/bedd-musl
+COPY --from=${BEDD_IMAGE} /opt/bedd/skills /opt/bedd/skills
+RUN set -eux; \
+    if command -v apk >/dev/null 2>&1; then \
+      ln -sf /usr/local/lib/bedd/bedd-musl /usr/local/bin/bedd; \
+    else \
+      ln -sf /usr/local/lib/bedd/bedd-gnu /usr/local/bin/bedd; \
+    fi; \
+    chmod 755 /usr/local/bin/bedd /usr/local/lib/bedd/bedd-gnu /usr/local/lib/bedd/bedd-musl
+ENV BEDD_SKILLS_DIR=/opt/bedd/skills
+
 COPY scripts/load-k8s-env.sh /usr/local/bin/load-k8s-env.sh
 COPY scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 COPY scripts/prisma-baseline.sh /usr/local/bin/prisma-baseline.sh
