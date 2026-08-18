@@ -81,28 +81,12 @@ def gh(*args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["gh"] + list(args), capture_output=True, text=True)
 
 
-def gh_json(path: str, jq: str = ".") -> object:
-    r = gh("api", "--paginate", path, "--jq", jq)
-    if r.returncode != 0:
-        raise RuntimeError(f"gh api {path} failed: {r.stderr.strip()}")
-    out = r.stdout.strip()
-    if not out:
-        return []
-    # --paginate with --jq emits one JSON value per page; wrap into a list.
-    values = []
-    for line in out.splitlines():
-        try:
-            values.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
-    return values
-
-
 def fetch_reviews(repo: str, pr: int) -> list[dict]:
     r = gh("api", f"repos/{repo}/pulls/{pr}/reviews", "--paginate",
            "--jq", ".[] | {id,user:.user.login,state,body,submitted_at,html_url:.html_url}")
     if r.returncode != 0:
-        return []
+        raise RuntimeError(f"gh api repos/{repo}/pulls/{pr}/reviews failed: "
+                           f"{r.stderr.strip()}")
     reviews = []
     for line in r.stdout.splitlines():
         line = line.strip()
@@ -230,12 +214,23 @@ def sweep(repo: str, limit: int) -> list[dict]:
     r = gh("pr", "list", "--repo", repo, "--state", "closed",
            "--limit", str(limit), "--json", "number,mergedAt")
     if r.returncode != 0:
+        print(f"[warn] skipping {repo}: gh pr list failed: {r.stderr.strip()}",
+              file=sys.stderr)
         return []
     try:
         prs = json.loads(r.stdout)
     except json.JSONDecodeError:
+        print(f"[warn] skipping {repo}: unparseable PR list", file=sys.stderr)
         return []
-    return [check_pr(repo, p["number"]) for p in prs if p.get("mergedAt")]
+    results = []
+    for p in prs:
+        if not p.get("mergedAt"):
+            continue
+        try:
+            results.append(check_pr(repo, p["number"]))
+        except RuntimeError as e:
+            print(f"[warn] skipping {repo}#{p['number']}: {e}", file=sys.stderr)
+    return results
 
 
 def render_sweep_report(results: list[dict], repos: list[str]) -> str:
@@ -309,9 +304,9 @@ def main():
         args.sweep = True
 
     if args.sweep:
-        repos = [full_repo(r) for r in ALL_REPOS] if args.all_repos else [full_repo(args.repo)]
         if not args.all_repos and not args.repo:
             raise SystemExit("--sweep needs --repo or --all-repos")
+        repos = [full_repo(r) for r in ALL_REPOS] if args.all_repos else [full_repo(args.repo)]
         all_results = []
         for repo in repos:
             print(f"[scan] {repo} (last {args.limit} merged PRs)...", file=sys.stderr)
@@ -325,7 +320,10 @@ def main():
     if not args.repo or not args.pr:
         raise SystemExit("Single-PR mode needs --repo and --pr (or use --sweep)")
     repo = full_repo(args.repo)
-    result = check_pr(repo, args.pr)
+    try:
+        result = check_pr(repo, args.pr)
+    except RuntimeError as e:
+        raise SystemExit(str(e))
 
     if args.json:
         print(json.dumps(result, indent=2))
