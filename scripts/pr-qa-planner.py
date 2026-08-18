@@ -295,18 +295,20 @@ def render_markdown(plan: dict, pr: dict, repo: str) -> str:
     lines.append("")
     lines.append("- Checkout the PR's head branch (not `main`) in each affected "
                  "submodule before starting the stack.")
-    lines.append(f"- Environment: `deepiri-platform/team_dev_environments/qa-team/"
-                 f"{'build.sh' if plan['rebuild_needed'] else 'start.sh'}` — "
-                 f"**{'rebuild required (lockfile/Dockerfile/submodule changes — a plain `start.sh` runs stale images)' if plan['rebuild_needed'] else 'no rebuild needed, plain start is fine'}**")
-    lines.append("- Run `stop.sh` when done — don't leave stacks running between PRs.")
+    lines.append(f"- Environment (consolidated, replaces team_dev_environments): "
+                 f"`bash setup-deepiri-dev.sh --team qa "
+                 f"{'--build ' if plan['rebuild_needed'] else ''}[--tier 1|2|3]` — "
+                 f"**{('rebuild required (lockfile/Dockerfile/submodule changes - add `--build` so stale images are not reused)') if plan['rebuild_needed'] else 'no rebuild needed, omit `--build`'}**")
+    lines.append("- Tear down when done: `docker compose -f docker-compose.dev.yml down` "
+                 "— don't leave stacks running between PRs.")
     lines.append("")
 
     # Phase 3 — Verification and testing
     lines.append("### 3. Verification and testing")
     lines.append("")
-    lines.append("- [ ] **Health check first:** confirm every container reports "
-                 "`healthy` before testing — a container still initializing produces "
-                 "false PR failures.")
+    lines.append("- [ ] **Health check first:** `docker compose -f docker-compose.dev.yml ps` "
+                 "— confirm every container reports `healthy` before testing; a container "
+                 "still initializing produces false PR failures.")
     lines.append("- [ ] **Sorge bot pass:** comment `/sorge` on the PR; treat it as a "
                  "first pass that informs (not replaces) manual review.")
     if plan["frontend_touched"]:

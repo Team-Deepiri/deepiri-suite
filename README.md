@@ -22,6 +22,13 @@ python3 scripts/pr-qa-planner.py --repo Team-Deepiri/deepiri-platform --pr 316 -
 Requires the `gh` CLI authenticated for the org. Stdlib only, no other
 dependencies. See the module docstring for full options.
 
+The plan follows the `deepiri-qa-workflow` skill: task identification
+(Plaky/inbox/cross-PR deps), environment bring-up via the consolidated
+`setup-deepiri-dev.sh --team qa` script (adds `--build` automatically when the
+PR touches lockfiles/Dockerfiles/submodule pointers), health check + `/sorge`
+first pass, frontend/backend verification, and the review-submission rule
+(Approve or Request Changes, never Comment-only).
+
 Images are published to **GitHub Container Registry**:
 
 | Tag | Base | Typical services |
