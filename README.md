@@ -29,6 +29,29 @@ PR touches lockfiles/Dockerfiles/submodule pointers), health check + `/sorge`
 first pass, frontend/backend verification, and the review-submission rule
 (Approve or Request Changes, never Comment-only).
 
+## PR Review Quality Enforcement
+
+`scripts/pr-review-quality-check.py` checks that Approve/Request-Changes
+reviews actually filled in the required test-report template (Environment,
+Health check, Sorge pass, Manual testing, Automated tests) instead of
+rubber-stamping with a bare "LGTM" or leaving the bracketed placeholders.
+
+```bash
+# Check one PR's latest final review
+python3 scripts/pr-review-quality-check.py --repo Team-Deepiri/deepiri-auth-service --pr 74
+
+# Same, and post a nudge comment tagging the reviewer if it's incomplete
+python3 scripts/pr-review-quality-check.py --repo Team-Deepiri/deepiri-auth-service --pr 74 --comment
+
+# Compliance report across a repo's recent merged PRs, by reviewer
+python3 scripts/pr-review-quality-check.py --repo Team-Deepiri/deepiri-auth-service --sweep --limit 30
+
+# Same, across every repo the QA team reviews
+python3 scripts/pr-review-quality-check.py --sweep --all-repos --limit 30
+```
+
+Requires the `gh` CLI authenticated for the org. Stdlib only.
+
 Images are published to **GitHub Container Registry**:
 
 | Tag | Base | Typical services |
