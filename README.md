@@ -2,6 +2,26 @@
 
 Shared Deepiri toolchain repository. Today it publishes the Node.js Docker base for Team Deepiri services: `curl`, `dumb-init`, `bash`, OpenSSL (Alpine), K8s env loader scripts, and a non-root `nodejs` user (uid/gid 1001).
 
+## PR QA Test Planner
+
+`scripts/pr-qa-planner.py` automatically tells QA engineers what to test on any
+Team-Deepiri pull request — including submodule-bump PRs against the
+`deepiri-platform` monorepo.
+
+```bash
+# Local analysis
+python3 scripts/pr-qa-planner.py --repo Team-Deepiri/deepiri-platform --pr 316
+
+# Post the test plan as a comment on the PR (QA checks off the checklist)
+python3 scripts/pr-qa-planner.py --repo Team-Deepiri/deepiri-api-gateway --pr 42 --comment
+
+# Machine-readable output for CI / other tooling
+python3 scripts/pr-qa-planner.py --repo Team-Deepiri/deepiri-platform --pr 316 --json
+```
+
+Requires the `gh` CLI authenticated for the org. Stdlib only, no other
+dependencies. See the module docstring for full options.
+
 Images are published to **GitHub Container Registry**:
 
 | Tag | Base | Typical services |
