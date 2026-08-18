@@ -170,6 +170,89 @@ def is_gitlink_change(f: dict) -> bool:
     return f.get("raw_url") is None and "Subproject commit" in (f.get("patch") or "")
 
 
+SUBPROJECT_SHA_RE = re.compile(r"^\+Subproject commit ([0-9a-f]{40})", re.MULTILINE)
+
+# Cross-repo refs like "Team-Deepiri/deepiri-web-frontend#123" — unambiguous,
+# no keyword needed.
+CROSS_REPO_REF_RE = re.compile(r"([A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+)#(\d+)")
+# Same-repo refs only count as a dependency link when introduced by a keyword
+# (otherwise "#123" in prose gives false positives).
+KEYWORD_REF_RE = re.compile(
+    r"(?im)^\s*(?:depends on|blocked by|related to|relates to|see also|requires)\s*:?\s*#(\d+)"
+)
+
+
+def fetch_pr_summary(repo: str, number: int) -> dict | None:
+    r = gh("api", f"repos/{repo}/pulls/{number}",
+           "--jq", "{number:.number,title:.title,url:.html_url,state:.state}")
+    if r.returncode != 0 or not r.stdout.strip():
+        return None
+    try:
+        return json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return None
+
+
+def find_referenced_prs(repo: str, pr_body: str, exclude_number: int = 0) -> list[dict]:
+    """PRs explicitly referenced in the PR description — cross-repo links or
+    same-repo refs introduced by a dependency keyword (depends on / blocked by
+    / relates to / see also / requires)."""
+    if not pr_body:
+        return []
+    found: list[dict] = []
+    seen: set[tuple[str, int]] = set()
+    for ref_repo, num_s in CROSS_REPO_REF_RE.findall(pr_body):
+        num = int(num_s)
+        key = (ref_repo.lower(), num)
+        if key in seen or (ref_repo.lower() == repo.lower() and num == exclude_number):
+            continue
+        seen.add(key)
+        summary = fetch_pr_summary(ref_repo, num)
+        if summary:
+            summary["repo"] = ref_repo
+            found.append(summary)
+    for num_s in KEYWORD_REF_RE.findall(pr_body):
+        num = int(num_s)
+        key = (repo.lower(), num)
+        if key in seen or num == exclude_number:
+            continue
+        seen.add(key)
+        summary = fetch_pr_summary(repo, num)
+        if summary:
+            summary["repo"] = repo
+            found.append(summary)
+    return found
+
+
+def resolve_submodule_bumps(files: list[dict], org: str) -> list[dict]:
+    """For each submodule pointer bump, find the exact target commit and the
+    PR in that submodule's repo (if any) that introduced it — so QA knows
+    precisely which branch/commit to check the submodule out to."""
+    out = []
+    for f in files:
+        if not is_gitlink_change(f):
+            continue
+        path = f["filename"]
+        short = path.rstrip("/").split("/")[-1]
+        sub_repo = f"{org}/{short}"
+        m = SUBPROJECT_SHA_RE.search(f.get("patch") or "")
+        sha = m.group(1) if m else None
+        pr_info = None
+        if sha:
+            r = gh("api", f"repos/{sub_repo}/commits/{sha}/pulls",
+                   "--jq", "(.[0] // empty) | {number,title,url:.html_url,head_ref:.head.ref}")
+            if r.returncode == 0 and r.stdout.strip():
+                try:
+                    pr_info = json.loads(r.stdout)
+                except json.JSONDecodeError:
+                    pr_info = None
+        out.append({
+            "path": path, "repo": sub_repo, "sha": sha,
+            "pr": pr_info or None,
+        })
+    return out
+
+
 def find_related_prs(repo: str, head_ref: str, exclude_number: int = 0) -> list[dict]:
     """Other open PRs sharing this head branch — a cross-PR dependency QA should
     test together (shared branch, dependent submodule bump)."""
@@ -286,10 +369,36 @@ def render_markdown(plan: dict, pr: dict, repo: str) -> str:
             lines.append(f"  - [#{rp['number']} {rp['title']}]({rp['url']})")
     else:
         lines.append("- No other open PR shares this head branch (tested in isolation)")
-    if plan["submodule_bumps"]:
-        lines.append("- **Submodule bumps:** this PR only moves submodule pointers — "
-                     "each bumped service must be tested in the integrated stack, and "
-                     "check the submodule repo for its own open PR at the new commit.")
+
+    referenced = plan.get("referenced_prs") or []
+    if referenced:
+        lines.append("- **Referenced PRs** (linked in the description — check these are "
+                     "merged/tested together where relevant):")
+        for rp in referenced:
+            lines.append(f"  - [{rp['repo']}#{rp['number']} {rp['title']}]({rp['url']}) — {rp['state']}")
+
+    bumps = plan.get("submodule_bump_details") or []
+    if bumps:
+        lines.append("- **Submodule bumps — check out these exact commits before testing:**")
+        for b in bumps:
+            sha_short = (b["sha"] or "?")[:8]
+            if b["pr"]:
+                p = b["pr"]
+                lines.append(
+                    f"  - `{b['path']}` → `{sha_short}` "
+                    f"(via [{b['repo']}#{p['number']} {p['title']}]({p['url']}), "
+                    f"branch `{p.get('head_ref', '?')}`) — "
+                    f"`git -C {b['path']} checkout {b['sha']}`"
+                )
+            elif b["sha"]:
+                lines.append(
+                    f"  - `{b['path']}` → `{sha_short}` (no open PR found for this commit "
+                    f"in `{b['repo']}` — likely already merged to its default branch) — "
+                    f"`git -C {b['path']} checkout {b['sha']}`"
+                )
+            else:
+                lines.append(f"  - `{b['path']}` — bump detected but target commit could not "
+                             f"be parsed from the diff; check manually")
     lines.append("")
 
     # Phase 2 — Local environment setup
@@ -511,6 +620,42 @@ def git_show_file(repo_path: str, rev: str, path: str) -> str | None:
     return r.stdout if r.returncode == 0 else None
 
 
+def detect_js_test_runner(repo_path: str) -> str | None:
+    pkg = os.path.join(repo_path, "package.json")
+    if not os.path.isfile(pkg):
+        return None
+    try:
+        with open(pkg) as fh:
+            data = json.load(fh)
+    except (json.JSONDecodeError, OSError):
+        return None
+    test_script = (data.get("scripts", {}) or {}).get("test", "")
+    for runner in ("vitest", "jest", "mocha", "ava"):
+        if runner in test_script:
+            return runner
+    deps = {**data.get("dependencies", {}), **data.get("devDependencies", {})}
+    for runner in ("vitest", "jest", "mocha", "ava"):
+        if runner in deps:
+            return runner
+    return None
+
+
+def test_command_for(cd_path: str, rel_path: str, runner: str | None) -> str:
+    """A concrete, runnable command for one specific test file — not the
+    generic per-area `npm test`."""
+    if rel_path.endswith(".py"):
+        return f"cd {cd_path} && pytest {rel_path} -v"
+    if runner == "vitest":
+        return f"cd {cd_path} && npx vitest run {rel_path}"
+    if runner == "mocha":
+        return f"cd {cd_path} && npx mocha {rel_path}"
+    if runner == "ava":
+        return f"cd {cd_path} && npx ava {rel_path}"
+    # default to jest — the most common runner across these services, and a
+    # safe guess when package.json couldn't be read
+    return f"cd {cd_path} && npx jest {rel_path}"
+
+
 def rg_files(repo_path: str, pattern: str, extra_globs: list[str] | None = None) -> list[str]:
     """Files containing `pattern`, via ripgrep (gitignored dirs auto-skipped)."""
     cmd = ["rg", "-l", "--no-messages", "-g", "!node_modules", "-g", "!*.lock",
@@ -543,6 +688,8 @@ def deep_analyze(repo: str, pr: dict, files: list[dict], workspace: str | None) 
             return {"available": False, "reason": "fetch_failed",
                     "clone_hint": f"git fetch origin {pr.get('head', {}).get('ref', '')}"}
 
+    cd_path = os.path.relpath(root, os.getcwd()) or "."
+    js_runner = detect_js_test_runner(root)
     changed = []
     for f in files:
         path = f["filename"]
@@ -571,14 +718,15 @@ def deep_analyze(repo: str, pr: dict, files: list[dict], workspace: str | None) 
             return os.path.relpath(u, root)
         users = sorted(set(relpath(u) for u in users if u.split("/")[-1] != base))[:12]
         neighbors = sorted(set(relpath(n) for n in neighbors))[:8]
+        test_files = sorted(set(u for u in users if any(m in u for m in TEST_MARKERS)))[:6]
         changed.append({
             "path": path,
             "symbols": syms,
             "imports": imports,
             "neighbors": neighbors,
             "users": users,
-            "tests": sorted(set(u for u in users
-                                if any(m in u for m in TEST_MARKERS)))[:6],
+            "tests": test_files,
+            "test_commands": [test_command_for(cd_path, t, js_runner) for t in test_files],
         })
 
     return {"available": True, "repo_path": root, "head_sha": head_sha,
@@ -606,7 +754,9 @@ def render_deep(deep: dict) -> list[str]:
         if cf["symbols"]:
             lines.append(f"  - Changed symbols/routes: `{', '.join(cf['symbols'])}`")
         if cf["tests"]:
-            lines.append(f"  - **Tests that exercise it (run these):** `{', '.join(cf['tests'])}`")
+            lines.append("  - **Tests that exercise it — run these:**")
+            for t, c in zip(cf["tests"], cf["test_commands"]):
+                lines.append(f"    - `{t}`: `{c}`")
         if cf["users"]:
             lines.append(f"  - Code that references it (smoke these): `{', '.join(cf['users'])}`")
         if cf["neighbors"]:
@@ -668,6 +818,9 @@ def main():
     plan = analyze(files)
     plan["pr_url"] = pr.get("html_url")
     plan["repo"] = args.repo
+    plan["referenced_prs"] = find_referenced_prs(args.repo, pr.get("body") or "",
+                                                 pr.get("number", 0))
+    plan["submodule_bump_details"] = resolve_submodule_bumps(files, args.org)
     if args.deep:
         plan["deep"] = deep_analyze(args.repo, pr, files, args.workspace)
 
