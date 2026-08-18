@@ -154,6 +154,36 @@ def non_code_only(file_paths: list[str]) -> bool:
     )
 
 
+# Files whose presence means a plain `start.sh` is not enough — QA must run
+# `build.sh` first (stale images silently produce false failures otherwise).
+REBUILD_TRIGGERS = [
+    "dockerfile", "docker-compose", "compose.yml", "compose.yaml",
+    "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock",
+    "requirements", "go.mod", "go.sum", "alpine",
+]
+
+
+def is_gitlink_change(f: dict) -> bool:
+    """True when the file is a submodule pointer bump, not a regular file edit."""
+    return f.get("raw_url") is None and "Subproject commit" in (f.get("patch") or "")
+
+
+def find_related_prs(repo: str, head_ref: str, exclude_number: int = 0) -> list[dict]:
+    """Other open PRs sharing this head branch — a cross-PR dependency QA should
+    test together (shared branch, dependent submodule bump)."""
+    if not head_ref:
+        return []
+    result = gh("pr", "list", "--repo", repo, "--state", "open",
+                "--head", head_ref, "--json", "number,title,url", "--limit", "20")
+    if result.returncode != 0:
+        return []
+    try:
+        return [p for p in json.loads(result.stdout)
+                if p.get("number") != exclude_number]
+    except json.JSONDecodeError:
+        return []
+
+
 def analyze(files: list[dict], changed_files_before: int = 0) -> dict:
     """Build the plan model from the PR's changed files."""
     areas: dict[str, dict] = defaultdict(
@@ -162,6 +192,10 @@ def analyze(files: list[dict], changed_files_before: int = 0) -> dict:
     risks: list[dict] = []
     all_paths = [f["filename"] for f in files]
     low_paths = [p.lower() for p in all_paths]
+    submodule_bumps = [f["filename"] for f in files if is_gitlink_change(f)]
+    rebuild_needed = any(
+        any(t in p for t in REBUILD_TRIGGERS) for p in low_paths
+    ) or bool(submodule_bumps)
 
     for f in files:
         label, cmd = classify_path(f["filename"])
@@ -208,6 +242,10 @@ def analyze(files: list[dict], changed_files_before: int = 0) -> dict:
         "total_deletions": sum(f.get("deletions", 0) for f in files),
         "tests_included": tests_included,
         "unknown_files": areas.get("(unknown / other)", {}).get("files", []),
+        "submodule_bumps": submodule_bumps,
+        "rebuild_needed": rebuild_needed,
+        "frontend_touched": any("web-frontend" in p or "frontend" in p for p in low_paths),
+        "backend_touched": any("platform-services/backend" in p or "backend" in p for p in low_paths),
     }
 
 
@@ -220,7 +258,8 @@ def render_markdown(plan: dict, pr: dict, repo: str) -> str:
     lines = []
     lines.append(f"## QA Test Plan — #{pr.get('number')}: {title}")
     lines.append("")
-    lines.append(f"_Automated by `deepiri-suite/scripts/pr-qa-planner.py` · repo `{repo}`_")
+    lines.append(f"_Automated by `deepiri-suite/scripts/pr-qa-planner.py` · repo `{repo}` · "
+                 "follows the `deepiri-qa-workflow` skill_")
     lines.append("")
     lines.append(f"- **Changed files:** {plan['total_files']} "
                  f"(+{plan['total_additions']}/-{plan['total_deletions']})")
@@ -230,16 +269,55 @@ def render_markdown(plan: dict, pr: dict, repo: str) -> str:
                  f"`{pr.get('base', {}).get('ref')}`")
     lines.append("")
 
-    if plan["risks"]:
-        lines.append("### Risk signals")
-        lines.append("")
-        lines.append("| Risk | What to check |")
-        lines.append("|------|---------------|")
-        for r in plan["risks"]:
-            lines.append(f"| **{r['flag']}** | {r['guidance']} |")
-        lines.append("")
+    # Phase 1 — Task identification
+    lines.append("### 1. Task identification")
+    lines.append("")
+    lines.append("- [ ] Confirm the assignment on the **Plaky board** and in the "
+                 "**GitHub review inbox** (`github.com/pulls/inbox`)")
+    related = find_related_prs(repo, pr.get("head", {}).get("ref", ""),
+                               pr.get("number", 0))
+    if related:
+        lines.append("- **Cross-PR dependency detected** — same head branch has other "
+                     "open PRs; test them together (shared branch / dependent "
+                     "submodule bump):")
+        for rp in related:
+            lines.append(f"  - [#{rp['number']} {rp['title']}]({rp['url']})")
+    else:
+        lines.append("- No other open PR shares this head branch (tested in isolation)")
+    if plan["submodule_bumps"]:
+        lines.append("- **Submodule bumps:** this PR only moves submodule pointers — "
+                     "each bumped service must be tested in the integrated stack, and "
+                     "check the submodule repo for its own open PR at the new commit.")
+    lines.append("")
 
-    lines.append("### Areas affected")
+    # Phase 2 — Local environment setup
+    lines.append("### 2. Local environment setup")
+    lines.append("")
+    lines.append("- Checkout the PR's head branch (not `main`) in each affected "
+                 "submodule before starting the stack.")
+    lines.append(f"- Environment: `deepiri-platform/team_dev_environments/qa-team/"
+                 f"{'build.sh' if plan['rebuild_needed'] else 'start.sh'}` — "
+                 f"**{'rebuild required (lockfile/Dockerfile/submodule changes — a plain `start.sh` runs stale images)' if plan['rebuild_needed'] else 'no rebuild needed, plain start is fine'}**")
+    lines.append("- Run `stop.sh` when done — don't leave stacks running between PRs.")
+    lines.append("")
+
+    # Phase 3 — Verification and testing
+    lines.append("### 3. Verification and testing")
+    lines.append("")
+    lines.append("- [ ] **Health check first:** confirm every container reports "
+                 "`healthy` before testing — a container still initializing produces "
+                 "false PR failures.")
+    lines.append("- [ ] **Sorge bot pass:** comment `/sorge` on the PR; treat it as a "
+                 "first pass that informs (not replaces) manual review.")
+    if plan["frontend_touched"]:
+        lines.append("- [ ] **Frontend:** verify UI/UX against the design spec, not "
+                     "just that the page loads.")
+    if plan["backend_touched"]:
+        lines.append("- [ ] **Backend:** verify functional requirements and data "
+                     "integrity — what the change actually persists or returns, not "
+                     "just that the endpoint responds.")
+    lines.append("")
+    lines.append("#### Areas affected")
     lines.append("")
     lines.append("| Area | Test command | Files | +/- |")
     lines.append("|------|--------------|-------|-----|")
@@ -255,17 +333,54 @@ def render_markdown(plan: dict, pr: dict, repo: str) -> str:
         )
     lines.append("")
 
-    lines.append("### Manual QA checklist")
+    if plan["risks"]:
+        lines.append("#### Risk signals")
+        lines.append("")
+        lines.append("| Risk | What to check |")
+        lines.append("|------|---------------|")
+        for r in plan["risks"]:
+            lines.append(f"| **{r['flag']}** | {r['guidance']} |")
+        lines.append("")
+
+    lines.append("#### Manual QA checklist")
     lines.append("")
-    lines.append("- [ ] Verify the app builds and boots (affected services listed above)")
     lines.append("- [ ] Run the per-area test commands above")
     lines.append("- [ ] Smoke-test the primary user flows touched by this change")
     lines.append("- [ ] Check for regressions in adjacent services (shared-lib changes ripple)")
     lines.append("- [ ] Confirm no secrets/credentials were introduced")
     lines.append("- [ ] Verify the PR matches the ticket/acceptance criteria")
     for r in plan["risks"]:
-        lines.append(f"- [ ] {r['flag']}: {r['guidance']}")
+        if r["keyword"] != "no-tests":
+            lines.append(f"- [ ] {r['flag']}: {r['guidance']}")
     lines.append("")
+
+    # Phase 4 — Documentation requirement
+    lines.append("### 4. Documentation")
+    lines.append("")
+    lines.append("Do **not** hold up this PR over missing README or changelog updates "
+                 "— current guidance says those are not a review blocker.")
+    lines.append("")
+
+    # Phase 5 — Submitting the review
+    lines.append("### 5. Submitting the review")
+    lines.append("")
+    lines.append("On the PR's **Files changed** tab, use **Submit review**. The summary "
+                 "must say what you actually tested:")
+    lines.append("")
+    lines.append("```text")
+    lines.append("Environment: [qa-team stack, build vs start]")
+    lines.append("Health check: [all containers healthy / issues]")
+    lines.append("Sorge pass: [what it flagged, how you handled it]")
+    lines.append("Manual testing: [what you exercised, frontend/backend]")
+    lines.append("Automated tests: [run / not run, why]")
+    lines.append("```")
+    lines.append("")
+    lines.append("- Select **Approve** if good to go, **Request Changes** if not "
+                 "(say specifically what needs looking into).")
+    lines.append("- **Never leave a plain Comment-only review** — always resolve to "
+                 "Approve or Request Changes.")
+    lines.append("")
+
     lines.append("<details><summary>Changed files</summary>")
     lines.append("")
     for f in sorted(plan["areas"].get("(unknown / other)", {}).get("files", [])):
