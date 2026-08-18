@@ -32,6 +32,8 @@ https://cli.github.com). No other dependencies.
 """
 import argparse
 import json
+import os
+import re
 import subprocess
 import sys
 from collections import defaultdict
@@ -344,6 +346,9 @@ def render_markdown(plan: dict, pr: dict, repo: str) -> str:
             lines.append(f"| **{r['flag']}** | {r['guidance']} |")
         lines.append("")
 
+    if plan.get("deep"):
+        lines.extend(render_deep(plan["deep"]))
+
     lines.append("#### Manual QA checklist")
     lines.append("")
     lines.append("- [ ] Run the per-area test commands above")
@@ -392,6 +397,228 @@ def render_markdown(plan: dict, pr: dict, repo: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Deep analysis: what specifically to test, via local code scan
+# ---------------------------------------------------------------------------
+#
+# Strategy to avoid a full recursive scan:
+#   1. Only parse the *changed* files (small set) for symbols/routes.
+#   2. Discover references with `rg` (ripgrep) — a single pass, gitignored
+#      dirs skipped automatically, returns file lists, not AST walks.
+#   3. Follow each changed file's imports to find its direct neighbors and
+#      any test files that exercise it. Depth is bounded to changed files +
+#      one import hop + one rg hop (who references the symbols).
+
+PY_SYMBOL = re.compile(
+    r"^(?:async\s+def|def)\s+(\w+)"
+    r"|^class\s+(\w+)"
+    r"|@\w+\.(?:get|post|put|delete|patch)\([\"']([^\"']*)",
+    re.MULTILINE,
+)
+TS_SYMBOL = re.compile(
+    r"^(?:export\s+)?(?:async\s+)?function\s+(\w+)"
+    r"|^(?:export\s+)?const\s+(\w+)\s*="
+    r"|^export\s+default\s+(\w+)"
+    r"|\.(?:get|post|put|delete|patch)\([\"']([^\"']*)"
+    r"|^(?:export\s+)?class\s+(\w+)",
+    re.MULTILINE,
+)
+IMPORT_RE = re.compile(r"(?:from\s+|require\(|import\s*\(?)[\"']([^\"']+)[\"']")
+
+
+# Symbols too generic to be worth a reverse-reference hop (they'd match half
+# the repo); still shown, but excluded from the "who references it" scan.
+GENERIC_SYMBOLS = {"logger", "log", "prisma", "redis", "router", "app",
+                   "server", "db", "client", "config", "utils", "helper",
+                   "index", "request", "response", "req", "res", "express"}
+
+
+def extract_symbols(content: str, path: str) -> list[str]:
+    """Symbols/routes defined in one file. Cheap regex scan of a single file."""
+    if path.endswith(".py"):
+        syms = [g for m in PY_SYMBOL.finditer(content) for g in m.groups() if g]
+    else:
+        syms = [g for m in TS_SYMBOL.finditer(content) for g in m.groups() if g]
+    return sorted(set(syms))
+
+
+def extract_imports(content: str) -> list[str]:
+    return IMPORT_RE.findall(content)
+
+
+def repo_root_hint(repo: str) -> str | None:
+    """Return a local path for the PR's repo if we can find it cheaply.
+
+    Checks, in order:
+      1. current directory is inside a git repo whose remote matches `repo`
+      2. DEEPIRI_QA_WORKSPACE env var (QA's checked-out clone root)
+      3. sibling/child dirs named after the repo's short name
+    """
+    short = repo.split("/")[-1]
+    candidates: list[str] = []
+    try:
+        top = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        candidates.append(top)
+        # If the current repo is the platform monorepo, the PR's repo may be a
+        # submodule nested deeper — resolve it via .gitmodules (cheap, exact).
+        gm = os.path.join(top, ".gitmodules")
+        if os.path.isfile(gm):
+            r = subprocess.run(
+                ["git", "config", "--file", gm, "--get-regexp",
+                 r"submodule\..*\.(path|url)"],
+                capture_output=True, text=True,
+            )
+            for line in r.stdout.splitlines():
+                if short not in line:
+                    continue
+                parts = line.split()
+                if len(parts) >= 2 and parts[0].endswith(".path"):
+                    candidates.append(os.path.join(top, parts[1]))
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+    ws = os.environ.get("DEEPIRI_QA_WORKSPACE")
+    if ws:
+        candidates.append(ws)
+        candidates.append(os.path.join(ws, short))
+    candidates.append(short)
+    candidates.append(f"./{short}")
+    for c in candidates:
+        if not c or not os.path.isdir(c):
+            continue
+        gitdir = os.path.join(c, ".git")
+        if os.path.isdir(gitdir) or os.path.isfile(gitdir):
+            r = subprocess.run(
+                ["git", "-C", c, "remote", "get-url", "origin"],
+                capture_output=True, text=True,
+            )
+            if r.returncode == 0 and short in r.stdout:
+                return c
+    return None
+
+
+def git_rev(repo_path: str, ref: str) -> str | None:
+    r = subprocess.run(["git", "-C", repo_path, "rev-parse", "--verify", ref],
+                       capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def git_show_file(repo_path: str, rev: str, path: str) -> str | None:
+    """Read a file at a specific rev WITHOUT checking anything out (non-destructive)."""
+    r = subprocess.run(["git", "-C", repo_path, "show", f"{rev}:{path}"],
+                       capture_output=True, text=True)
+    return r.stdout if r.returncode == 0 else None
+
+
+def rg_files(repo_path: str, pattern: str, extra_globs: list[str] | None = None) -> list[str]:
+    """Files containing `pattern`, via ripgrep (gitignored dirs auto-skipped)."""
+    cmd = ["rg", "-l", "--no-messages", "-g", "!node_modules", "-g", "!*.lock",
+           "--glob", "*.{py,ts,tsx,js,jsx}", pattern, repo_path]
+    if extra_globs:
+        for g in extra_globs:
+            cmd.append("-g")
+            cmd.append(g)
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode not in (0, 1):
+        return []
+    return [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
+
+
+def deep_analyze(repo: str, pr: dict, files: list[dict], workspace: str | None) -> dict:
+    """Scan the local repo for what specifically exercises the changed code."""
+    short = repo.split("/")[-1]
+    root = repo_root_hint(repo)
+    head_sha = pr.get("head", {}).get("sha")
+    if not root or head_sha is None:
+        return {"available": False, "reason": "no_local_repo",
+                "clone_hint": f"git clone https://github.com/{repo}.git && "
+                              f"git -C {short} fetch origin {pr.get('head', {}).get('ref', '')}"}
+
+    if git_rev(root, head_sha) is None:
+        r = subprocess.run(["git", "-C", root, "fetch", "origin",
+                            pr.get("head", {}).get("ref", "")],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            return {"available": False, "reason": "fetch_failed",
+                    "clone_hint": f"git fetch origin {pr.get('head', {}).get('ref', '')}"}
+
+    changed = []
+    for f in files:
+        path = f["filename"]
+        if not path.endswith((".py", ".ts", ".tsx", ".js", ".jsx")):
+            continue
+        content = git_show_file(root, head_sha, path)
+        if content is None:
+            continue
+        syms = extract_symbols(content, path)
+        imports = extract_imports(content)
+        # one import hop: what do the changed files themselves touch?
+        neighbors = []
+        for imp in imports:
+            base = imp.split("/")[-1].removesuffix(".py")
+            if base and base not in (".", ".."):
+                hits = rg_files(root, rf"(from|import|require)\('?[^'\"\n]*{re.escape(base)}['\"]?")
+                neighbors += [h for h in hits if h.split("/")[-1] != path.split("/")[-1]]
+        # reverse hop: who references the changed symbols (tests + consumers)?
+        users = []
+        for s in syms:
+            if s in GENERIC_SYMBOLS:
+                continue
+            users += rg_files(root, rf"\b{re.escape(s)}\b")
+        base = path.split("/")[-1]
+        def relpath(u: str) -> str:
+            return os.path.relpath(u, root)
+        users = sorted(set(relpath(u) for u in users if u.split("/")[-1] != base))[:12]
+        neighbors = sorted(set(relpath(n) for n in neighbors))[:8]
+        changed.append({
+            "path": path,
+            "symbols": syms,
+            "imports": imports,
+            "neighbors": neighbors,
+            "users": users,
+            "tests": sorted(set(u for u in users
+                                if any(m in u for m in TEST_MARKERS)))[:6],
+        })
+
+    return {"available": True, "repo_path": root, "head_sha": head_sha,
+            "files": changed}
+
+
+def render_deep(deep: dict) -> list[str]:
+    lines = []
+    if not deep.get("available"):
+        lines.append("> **Deep scan:** no local checkout of this repo found. "
+                     f"Clone it first so the plan can find what to test:\n>\n"
+                     f"> ```bash\n> {deep.get('clone_hint')}\n> ```")
+        return lines
+    lines.append("#### What to test (deep scan of local code)")
+    lines.append("")
+    lines.append(f"_Scanned `{deep.get('repo_path')}` at `{deep.get('head_sha', '')[:8]}` "
+                 "— only changed files parsed, references found via ripgrep._")
+    lines.append("")
+    any_hits = False
+    for cf in deep.get("files", []):
+        if not (cf["symbols"] or cf["neighbors"] or cf["users"] or cf["tests"]):
+            continue
+        any_hits = True
+        lines.append(f"- **`{cf['path']}`**")
+        if cf["symbols"]:
+            lines.append(f"  - Changed symbols/routes: `{', '.join(cf['symbols'])}`")
+        if cf["tests"]:
+            lines.append(f"  - **Tests that exercise it (run these):** `{', '.join(cf['tests'])}`")
+        if cf["users"]:
+            lines.append(f"  - Code that references it (smoke these): `{', '.join(cf['users'])}`")
+        if cf["neighbors"]:
+            lines.append(f"  - Directly imports (regression-check these): `{', '.join(cf['neighbors'])}`")
+    if not any_hits:
+        lines.append("- No test/consumer references found for changed files — "
+                     "manual QA coverage applies.")
+    lines.append("")
+    return lines
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -411,6 +638,10 @@ def main():
     ap.add_argument("--org", default=ORG, help=f"GitHub org (default: {ORG})")
     ap.add_argument("--json", action="store_true", help="print plan as JSON")
     ap.add_argument("--comment", action="store_true", help="post plan as PR comment")
+    ap.add_argument("--deep", action="store_true",
+                    help="scan local checkout to find exactly what to test")
+    ap.add_argument("--workspace", help="dir to search for local clones "
+                                        "(default: $DEEPIRI_QA_WORKSPACE)")
     ap.add_argument("--out", help="write markdown plan to this file")
     args = ap.parse_args()
 
@@ -437,6 +668,8 @@ def main():
     plan = analyze(files)
     plan["pr_url"] = pr.get("html_url")
     plan["repo"] = args.repo
+    if args.deep:
+        plan["deep"] = deep_analyze(args.repo, pr, files, args.workspace)
 
     if args.json:
         print(json.dumps(plan, indent=2))
