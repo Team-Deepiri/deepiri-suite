@@ -201,42 +201,73 @@ def ensure_gh_ready(skip: bool = False) -> None:
                              "and re-run this script.")
 
 
+# One generic package-manager table shared by every auto-installer in this
+# script, instead of the same if/elif "apt-get, dnf, pacman, snap, brew,
+# winget" chain hand-copied per tool (and each copy only covering a subset).
+# Note WSL needs no special-casing here: it runs a real Linux distro, so its
+# distro's normal manager (apt/dnf/pacman/zypper/...) already applies —
+# `platform.system()` correctly reports "Linux" inside WSL.
+PACKAGE_MANAGERS: list[tuple[str, list[str]]] = [
+    ("brew", ["brew", "install", "{pkg}"]),
+    ("apt-get", ["sudo", "apt-get", "install", "-y", "{pkg}"]),
+    ("dnf", ["sudo", "dnf", "install", "-y", "{pkg}"]),
+    ("yum", ["sudo", "yum", "install", "-y", "{pkg}"]),
+    ("pacman", ["sudo", "pacman", "-S", "--noconfirm", "{pkg}"]),
+    ("zypper", ["sudo", "zypper", "install", "-y", "{pkg}"]),
+    ("apk", ["sudo", "apk", "add", "{pkg}"]),
+    ("snap", ["sudo", "snap", "install", "{pkg}"]),
+    ("winget", ["winget", "install", "--id", "{pkg}"]),
+    ("choco", ["choco", "install", "-y", "{pkg}"]),
+    ("scoop", ["scoop", "install", "{pkg}"]),
+]
+
+
+def install_via_package_manager(pkg_names: dict[str, str], timeout: int = 180) -> bool:
+    """Try every package manager actually present on this machine, in the
+    order above, until one succeeds. `pkg_names` maps manager-binary -> the
+    package name for that manager (names sometimes differ, e.g. "ripgrep"
+    vs winget's "BurntSushi.ripgrep.MSVC") — a manager not present in
+    `pkg_names` is skipped even if it's installed, so callers only offer
+    managers they actually have a package name for."""
+    for binary, template in PACKAGE_MANAGERS:
+        pkg = pkg_names.get(binary)
+        if not pkg or not shutil.which(binary):
+            continue
+        cmd = [part.format(pkg=pkg) for part in template]
+        try:
+            if subprocess.run(cmd, timeout=timeout).returncode == 0:
+                return True
+        except (subprocess.TimeoutExpired, OSError):
+            continue
+    return False
+
+
 def _install_gh() -> bool:
-    """Best-effort install of the gh CLI via the current platform's package
-    manager. Falls back through managers in order until one works."""
-    system = platform.system()
-    try:
-        if system == "Darwin" and shutil.which("brew"):
-            return subprocess.run(["brew", "install", "gh"]).returncode == 0
-        if system == "Linux":
-            if shutil.which("apt-get"):
-                if subprocess.run(["sudo", "apt-get", "install", "-y", "gh"]).returncode == 0:
-                    return True
-                # Not in the default repos on this release — add the official
-                # apt source (per https://cli.github.com/) and retry.
-                setup = (
-                    "curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg "
-                    "| sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg && "
-                    "sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg && "
-                    'echo "deb [arch=$(dpkg --print-architecture) '
-                    "signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] "
-                    'https://cli.github.com/packages stable main" | '
-                    "sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null && "
-                    "sudo apt-get update && sudo apt-get install -y gh"
-                )
-                return subprocess.run(["bash", "-c", setup]).returncode == 0
-            if shutil.which("dnf"):
-                return subprocess.run(["sudo", "dnf", "install", "-y", "gh"]).returncode == 0
-            if shutil.which("yum"):
-                return subprocess.run(["sudo", "yum", "install", "-y", "gh"]).returncode == 0
-            if shutil.which("pacman"):
-                return subprocess.run(["sudo", "pacman", "-S", "--noconfirm", "github-cli"]).returncode == 0
-            if shutil.which("snap"):
-                return subprocess.run(["sudo", "snap", "install", "gh"]).returncode == 0
-        if system == "Windows" and shutil.which("winget"):
-            return subprocess.run(["winget", "install", "--id", "GitHub.cli"]).returncode == 0
-    except (subprocess.CalledProcessError, OSError):
-        return False
+    """Best-effort install of the gh CLI via whichever package manager this
+    machine actually has."""
+    if install_via_package_manager({
+        "brew": "gh", "apt-get": "gh", "dnf": "gh", "yum": "gh",
+        "pacman": "github-cli", "zypper": "gh", "apk": "github-cli",
+        "snap": "gh", "winget": "GitHub.cli", "choco": "gh", "scoop": "gh",
+    }):
+        return True
+    # apt's default repos don't carry `gh` on some releases — add the
+    # official apt source (per https://cli.github.com/) and retry.
+    if shutil.which("apt-get"):
+        setup = (
+            "curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg "
+            "| sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg && "
+            "sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg && "
+            'echo "deb [arch=$(dpkg --print-architecture) '
+            "signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] "
+            'https://cli.github.com/packages stable main" | '
+            "sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null && "
+            "sudo apt-get update && sudo apt-get install -y gh"
+        )
+        try:
+            return subprocess.run(["bash", "-c", setup], timeout=180).returncode == 0
+        except (subprocess.TimeoutExpired, OSError):
+            return False
     return False
 
 # ---------------------------------------------------------------------------
@@ -1092,49 +1123,74 @@ def find_service_info(compose_root: str, short_repo: str) -> dict | None:
     return None
 
 
+_CONTAINER_ENGINE: str | None = None
 _COMPOSE_CMD: str | None = None
 
 
+def detect_container_engine() -> str:
+    """Which container CLI this environment actually has — docker or
+    podman (the two real-world options; podman's CLI is Docker-compatible
+    by design). If the project ever moves off Docker, this adapts instead
+    of assuming "docker" forever. Prefers whichever is actually on PATH;
+    docker wins if both are present since that's what this platform's own
+    compose files currently target — but that's a tiebreak on live
+    detection, not a hardcoded assumption that Docker is the only option."""
+    global _CONTAINER_ENGINE
+    if _CONTAINER_ENGINE is not None:
+        return _CONTAINER_ENGINE
+    if shutil.which("docker"):
+        _CONTAINER_ENGINE = "docker"
+    elif shutil.which("podman"):
+        _CONTAINER_ENGINE = "podman"
+    else:
+        _CONTAINER_ENGINE = "docker"  # neither present — most common default guess
+    return _CONTAINER_ENGINE
+
+
 def detect_compose_command() -> str:
-    """Docker Compose ships two incompatible invocations depending on the
-    install: the v2 plugin ('docker compose', space) or the legacy
-    standalone v1 binary ('docker-compose', hyphen). Detect which this
-    machine actually has instead of assuming one."""
+    """Compose ships multiple incompatible invocations depending on engine
+    and install: the v2 plugin ('docker compose'/'podman compose', space)
+    or a legacy standalone binary ('docker-compose'/'podman-compose',
+    hyphen). Detect which this machine actually has instead of assuming
+    one — and detect it for whichever engine is actually present."""
     global _COMPOSE_CMD
     if _COMPOSE_CMD is not None:
         return _COMPOSE_CMD
-    if shutil.which("docker"):
+    engine = detect_container_engine()
+    if shutil.which(engine):
         try:
-            r = subprocess.run(["docker", "compose", "version"],
+            r = subprocess.run([engine, "compose", "version"],
                                capture_output=True, text=True, timeout=5)
             if r.returncode == 0:
-                _COMPOSE_CMD = "docker compose"
+                _COMPOSE_CMD = f"{engine} compose"
                 return _COMPOSE_CMD
         except (subprocess.TimeoutExpired, OSError):
             pass
-    if shutil.which("docker-compose"):
-        _COMPOSE_CMD = "docker-compose"
+    standalone = "podman-compose" if engine == "podman" else "docker-compose"
+    if shutil.which(standalone):
+        _COMPOSE_CMD = standalone
         return _COMPOSE_CMD
-    _COMPOSE_CMD = "docker compose"  # neither detectable — most common default
+    _COMPOSE_CMD = f"{engine} compose"  # neither detectable — most common default
     return _COMPOSE_CMD
 
 
 def build_docker_commands(service_info: dict | None) -> list[str]:
-    """Standard debug commands for one service's container. `docker logs`/
-    `exec`/`compose restart` are the Docker CLI's own fixed vocabulary (no
+    """Standard debug commands for one service's container. `logs`/`exec`/
+    `compose restart` are a container CLI's own fixed vocabulary (no
     "dynamic source" for a tool's own command names, same as `curl -X` or
-    `git checkout`) — but the compose invocation style and the container's
-    shell genuinely vary by environment, so those are detected live rather
-    than assumed."""
+    `git checkout`) — but WHICH engine (docker vs podman), which compose
+    invocation, and the container's shell all genuinely vary by
+    environment, so those are detected live rather than assumed."""
     if not service_info:
         return []
+    engine = detect_container_engine()
     compose_cmd = detect_compose_command()
     container = service_info["container_name"]
     return [
-        f"docker logs -f {container}",
+        f"{engine} logs -f {container}",
         # bash if the image has it, falling back to sh (busybox/alpine
         # images usually don't ship bash) — tried live, not assumed.
-        f"docker exec -it {container} bash || docker exec -it {container} sh",
+        f"{engine} exec -it {container} bash || {engine} exec -it {container} sh",
         f"{compose_cmd} -f {service_info['compose_file']} restart {service_info['service_key']}",
     ]
 
@@ -1310,24 +1366,11 @@ def ensure_rg_ready() -> bool:
         return True
     print("[setup] ripgrep ('rg') not found — attempting to install it...",
           file=sys.stderr)
-    system = platform.system()
-    ok = False
-    try:
-        if system == "Darwin" and shutil.which("brew"):
-            ok = subprocess.run(["brew", "install", "ripgrep"]).returncode == 0
-        elif system == "Linux":
-            if shutil.which("apt-get"):
-                ok = subprocess.run(["sudo", "apt-get", "install", "-y", "ripgrep"]).returncode == 0
-            elif shutil.which("dnf"):
-                ok = subprocess.run(["sudo", "dnf", "install", "-y", "ripgrep"]).returncode == 0
-            elif shutil.which("pacman"):
-                ok = subprocess.run(["sudo", "pacman", "-S", "--noconfirm", "ripgrep"]).returncode == 0
-            elif shutil.which("snap"):
-                ok = subprocess.run(["sudo", "snap", "install", "ripgrep", "--classic"]).returncode == 0
-        elif system == "Windows" and shutil.which("winget"):
-            ok = subprocess.run(["winget", "install", "--id", "BurntSushi.ripgrep.MSVC"]).returncode == 0
-    except OSError:
-        ok = False
+    ok = install_via_package_manager({
+        "brew": "ripgrep", "apt-get": "ripgrep", "dnf": "ripgrep", "yum": "ripgrep",
+        "pacman": "ripgrep", "zypper": "ripgrep", "apk": "ripgrep", "snap": "ripgrep",
+        "winget": "BurntSushi.ripgrep.MSVC", "choco": "ripgrep", "scoop": "ripgrep",
+    })
     if not ok or shutil.which("rg") is None:
         print("[warn] could not auto-install ripgrep — --deep's cross-reference "
               "search will find nothing. Install manually: https://github.com/BurntSushi/ripgrep",
@@ -1415,6 +1458,7 @@ def _scan_one_file(root: str, rev: str, path: str, cd_path: str, js_runner: str 
     test_files = sorted(set(u for u in users if any(m in u for m in TEST_MARKERS)))[:6]
     return {
         "path": path,
+        "content": content,
         "symbols": syms,
         "imports": imports,
         "neighbors": neighbors,
@@ -1439,6 +1483,27 @@ def fetch_repo_file_remote(repo: str, ref: str, path: str) -> str | None:
         return base64.b64decode(r.stdout.strip()).decode("utf-8", errors="replace")
     except (ValueError, UnicodeDecodeError):
         return None
+
+
+def resolve_relative_import(base_path: str, imp: str, known_extensions: set[str] | None = None) -> list[str]:
+    """Candidate resolved paths for a relative import spec, trying
+    extensions and index files — pure path math, no filesystem/clone
+    needed, so this works against a remote-only fetch.
+
+    `known_extensions` should be the extensions actually observed among the
+    PR's own changed files — deriving candidates from what the project is
+    actually written in, instead of a fixed hardcoded language list that
+    would silently miss anything outside it (Go, Ruby, Vue SFCs, whatever)."""
+    if not imp.startswith("."):
+        return []
+    joined = os.path.normpath(os.path.join(os.path.dirname(base_path), imp)).replace("\\", "/")
+    if os.path.splitext(joined)[1]:
+        return [joined]
+    exts = known_extensions or {".ts", ".tsx", ".js", ".jsx", ".py"}  # fallback only if nothing else is known
+    js_like = {e for e in exts if e in (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")}
+    candidates = [joined + ext for ext in exts]
+    candidates += [f"{joined}/index{ext}" for ext in (js_like or exts)]
+    return candidates
 
 
 def deep_analyze_remote(repo: str, files: list[dict], head_sha: str) -> dict:
@@ -1495,15 +1560,106 @@ def deep_analyze_remote(repo: str, files: list[dict], head_sha: str) -> dict:
                         f"Open {dev_url} and visually verify `{s}` (changed in `{path}`) - "
                         "check it renders, layout/spacing look right, no console errors."
                     )
+        imports = extract_imports(content)
         changed.append({
-            "path": path, "symbols": syms, "imports": extract_imports(content),
+            "path": path, "content": content, "symbols": syms, "imports": imports,
             "neighbors": [], "users": [], "tests": [], "test_commands": [],
             "routes": route_commands, "visual_checks": visual_checks,
         })
 
+    # No local tree to grep for "who else references this" remotely, so the
+    # semantic signal here is different: resolve each changed file's own
+    # relative imports and fetch whichever candidate actually exists —
+    # "this file needs these to make sense" instead of "these need this".
+    changed_paths = {f["filename"] for f in files}
+    known_extensions = {os.path.splitext(p)[1] for p in changed_paths if os.path.splitext(p)[1]}
+    scores: dict[str, int] = {}
+    for entry in changed:
+        for imp in entry["imports"]:
+            for candidate in resolve_relative_import(entry["path"], imp, known_extensions):
+                if candidate in changed_paths:
+                    continue
+                scores[candidate] = scores.get(candidate, 0) + 2
+
+    context_files = []
+    for candidate, score in sorted(scores.items(), key=lambda kv: -kv[1]):
+        content = fetch_repo_file_remote(repo, head_sha, candidate)
+        if content is None:
+            continue  # not every candidate extension actually exists
+        if len(content) > MAX_CONTEXT_FILE_BYTES:
+            content = content[:MAX_CONTEXT_FILE_BYTES] + \
+                f"\n... [truncated — file is over {MAX_CONTEXT_FILE_BYTES // 1000}KB]"
+        context_files.append({"path": candidate, "content": content, "score": score})
+        if len(context_files) >= MAX_CONTEXT_FILES:
+            break
+
     return {"available": True, "repo_path": f"{repo} (remote — no local checkout, fetched via GitHub API)",
             "head_sha": head_sha, "files": changed, "docker_commands": docker_commands,
-            "remote_only": True}
+            "remote_only": True, "context_files": context_files}
+
+
+MAX_CONTEXT_FILES = 25
+MAX_CONTEXT_FILE_BYTES = 50_000  # per-file cap so one huge generated/minified
+                                 # file doesn't blow out the whole bundle
+
+
+class ContextCollector:
+    """Picks up to MAX_CONTEXT_FILES *unchanged but related* files to bundle
+    full content for, alongside the PR's own changed files — the "what else
+    does an engineer (or an AI handed this plan) need open to understand
+    this change" set. Scored, not just "first N found":
+
+      +3  it's a test file that exercises a changed file
+      +2  it directly references a changed symbol ("users" from the rg hop)
+      +2  the changed file directly imports it ("neighbors")
+      +1  it sits in the same directory as the changed file
+      +1  its filename stem overlaps the changed file's stem (Foo.ts /
+          Foo.types.ts / useFoo.ts style companion files)
+
+    Scores accumulate across every changed file that references a given
+    candidate, so a shared util genuinely used everywhere naturally rises
+    to the top instead of an arbitrary first-seen file."""
+
+    def __init__(self):
+        self._scores: dict[tuple[str, str, str], int] = {}
+
+    def bump(self, root: str, rev: str, relpath: str, changed_path: str, base_score: int) -> None:
+        score = base_score
+        if os.path.dirname(relpath) == os.path.dirname(changed_path):
+            score += 1
+        changed_stem = os.path.splitext(os.path.basename(changed_path))[0].lower()
+        path_stem = os.path.splitext(os.path.basename(relpath))[0].lower()
+        if changed_stem and (changed_stem in path_stem or path_stem in changed_stem):
+            score += 1
+        key = (root, rev, relpath)
+        self._scores[key] = self._scores.get(key, 0) + score
+
+    def add_from_entry(self, root: str, rev: str, entry: dict, changed_path: str) -> None:
+        for t in entry.get("tests", []):
+            self.bump(root, rev, t, changed_path, 3)
+        for u in entry.get("users", []):
+            self.bump(root, rev, u, changed_path, 2)
+        for n in entry.get("neighbors", []):
+            self.bump(root, rev, n, changed_path, 2)
+
+    def finalize(self, exclude: set[tuple[str, str]]) -> list[dict]:
+        """Fetch content for the top-scored candidates, skipping anything
+        already covered by the PR's own changed-file list."""
+        ranked = sorted(self._scores.items(), key=lambda kv: -kv[1])
+        out = []
+        for (root, rev, relpath), score in ranked:
+            if (root, relpath) in exclude:
+                continue
+            content = git_show_file(root, rev, relpath)
+            if content is None:
+                continue
+            if len(content) > MAX_CONTEXT_FILE_BYTES:
+                content = content[:MAX_CONTEXT_FILE_BYTES] + \
+                    f"\n... [truncated — file is over {MAX_CONTEXT_FILE_BYTES // 1000}KB]"
+            out.append({"path": relpath, "content": content, "score": score})
+            if len(out) >= MAX_CONTEXT_FILES:
+                break
+        return out
 
 
 def deep_analyze(repo: str, pr: dict, files: list[dict], workspace: str | None) -> dict:
@@ -1539,10 +1695,12 @@ def deep_analyze(repo: str, pr: dict, files: list[dict], workspace: str | None) 
     # vite config — computed lazily, only if a frontend file actually changed.
     frontend_port_state: list[str] = []  # lazily-filled 0/1-item cache slot
     changed = []
+    context = ContextCollector()
     for f in files:
         entry = _scan_one_file(root, head_sha, f["filename"], cd_path, js_runner,
                                backend_port, frontend_port_state)
         if entry:
+            context.add_from_entry(root, head_sha, entry, entry["path"])
             changed.append(entry)
 
     # Submodule bumps show up here as a one-line gitlink pointer change, not
@@ -1585,11 +1743,16 @@ def deep_analyze(repo: str, pr: dict, files: list[dict], workspace: str | None) 
             entry = _scan_one_file(sub_root, new_sha, sp, sub_cd_path, sub_js_runner,
                                    sub_backend_port, frontend_port_state)
             if entry:
+                context.add_from_entry(sub_root, new_sha, entry, sp)
                 entry["path"] = f"{sub_path}/{sp}"
                 changed.append(entry)
 
+    exclude = {(root, f["filename"]) for f in files}
+    context_files = context.finalize(exclude)
+
     return {"available": True, "repo_path": root, "head_sha": head_sha,
-            "files": changed, "docker_commands": docker_commands}
+            "files": changed, "docker_commands": docker_commands,
+            "context_files": context_files}
 
 
 def render_deep(deep: dict) -> list[str]:
@@ -1613,6 +1776,14 @@ def render_deep(deep: dict) -> list[str]:
         lines.append("- **Service commands (docker):**")
         for cmd in deep["docker_commands"]:
             lines.append(f"  - `{cmd}`")
+        lines.append("")
+    if deep.get("context_files"):
+        lines.append(f"- **{len(deep['context_files'])} related file(s) bundled for context** "
+                     "(full content, not just names — ranked by relevance: test coverage, "
+                     "references, shared imports, naming similarity). Not dumped here to keep "
+                     "this readable; included automatically in the `p` AI-prompt export:")
+        for cf in deep["context_files"]:
+            lines.append(f"  - `{cf['path']}` (relevance {cf['score']})")
         lines.append("")
     any_hits = False
     for cf in deep.get("files", []):
@@ -1989,23 +2160,46 @@ def _copyable_text(raw: str) -> str:
     return codes[-1] if codes else raw.strip()
 
 
-AI_AGENT_PROMPT_TEMPLATE = """You are acting as a QA engineer testing a pull request. Below is a complete QA test plan generated for it — environment setup, exact commands to run (curl/docker/test), visual checks, and a checklist.
+AI_AGENT_PROMPT_TEMPLATE = """You are acting as a QA engineer testing a pull request. Below is a complete QA test plan generated for it — environment setup, exact commands to run (curl/docker/test), visual checks, and a checklist — followed by the actual source of the changed files and related codebase context, so you're not working from the diff alone.
 
-Work through it end to end: run every command shown and note its actual output/exit status, open any URLs mentioned to check the UI, and check off each item as you complete it. If a command fails or a visual check looks wrong, say so specifically (what you expected vs. what happened) rather than just marking it failed. Finish with a summary: what passed, what failed, what needs a human to look at.
+Work through the plan end to end: run every command shown and note its actual output/exit status, open any URLs mentioned to check the UI, and check off each item as you complete it. Use the source below to understand what the change actually does before judging whether a result is correct. If a command fails or a visual check looks wrong, say so specifically (what you expected vs. what happened) rather than just marking it failed. Finish with a summary: what passed, what failed, what needs a human to look at.
 
 --- QA TEST PLAN ---
 {plan_body}
 --- END OF PLAN ---
-
+{codebase_context}
 Begin now."""
 
 
-def synthesize_ai_prompt(lines: list[dict]) -> str:
+def _format_file_block(path: str, content: str, note: str = "") -> str:
+    return f"\n### {path}{f' ({note})' if note else ''}\n```\n{content}\n```\n"
+
+
+def synthesize_ai_prompt(lines: list[dict], deep: dict | None = None) -> str:
     """Package the current state of the report (including any checkboxes
     already toggled) into a single prompt an AI coding assistant can be
-    handed to execute the whole test plan."""
+    handed to execute the whole test plan — plus the actual full content of
+    every changed file and up to MAX_CONTEXT_FILES semantically-related
+    unchanged files, not just the diff, so the assistant has real codebase
+    context instead of an isolated patch."""
     plan_body = "\n".join(_render_report_line(l) for l in lines)
-    return AI_AGENT_PROMPT_TEMPLATE.format(plan_body=plan_body)
+    codebase_context = ""
+    if deep and deep.get("available"):
+        blocks = []
+        changed_files = deep.get("files", [])
+        context_files = deep.get("context_files", [])
+        if changed_files or context_files:
+            blocks.append("\n--- CODEBASE CONTEXT ---")
+        for cf in changed_files:
+            if cf.get("content"):
+                blocks.append(_format_file_block(cf["path"], cf["content"], "changed"))
+        for cf in context_files:
+            blocks.append(_format_file_block(cf["path"], cf["content"],
+                                             f"related, relevance {cf['score']}"))
+        if len(blocks) > 1:
+            blocks.append("--- END CODEBASE CONTEXT ---\n")
+            codebase_context = "\n".join(blocks)
+    return AI_AGENT_PROMPT_TEMPLATE.format(plan_body=plan_body, codebase_context=codebase_context)
 
 
 URL_RE = re.compile(r"https?://\S+")
@@ -2204,10 +2398,12 @@ def _pick_export_path(stdscr, curses, start_dir: str, default_filename: str) -> 
                 return os.path.join(cur_dir, choice)
 
 
-def run_interactive_report(md: str, export_path: str) -> bool:
+def run_interactive_report(md: str, export_path: str, deep: dict | None = None) -> bool:
     """Curses checklist viewer over the generated plan. Returns True if it
     ran (caller shouldn't also flat-print); False if curses isn't usable
-    here and the caller should fall back to a plain print."""
+    here and the caller should fall back to a plain print. `deep` (if
+    available) carries full changed-file + related-file content, bundled
+    into the 'p' AI-prompt export so it's not just working from the diff."""
     try:
         import curses
     except ImportError:
@@ -2284,7 +2480,7 @@ def run_interactive_report(md: str, export_path: str) -> bool:
                          if copy_to_clipboard(text_to_copy)
                          else "[no clipboard tool found — install xclip/xsel/wl-copy/pbcopy]")
             elif key == ord("p"):
-                prompt_text = synthesize_ai_prompt(lines)
+                prompt_text = synthesize_ai_prompt(lines, deep)
                 if copy_to_clipboard(prompt_text):
                     status = "[AI prompt copied to clipboard — paste into your assistant]"
                 else:
@@ -2418,7 +2614,7 @@ def run_plan(args) -> None:
     shown_interactively = False
     if not args.plain and sys.stdout.isatty():
         default_export = args.out or f"qa-plan-{args.repo.split('/')[-1]}-{pr_number}.md"
-        shown_interactively = run_interactive_report(md, default_export)
+        shown_interactively = run_interactive_report(md, default_export, plan.get("deep"))
     if not shown_interactively:
         print(md)
 
