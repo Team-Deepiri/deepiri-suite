@@ -19,6 +19,14 @@ Run it against any PR in the org:
     python3 scripts/pr-qa-planner.py --repo Team-Deepiri/deepiri-platform --pr 316
     python3 scripts/pr-qa-planner.py --repo Team-Deepiri/deepiri-api-gateway --pr 42
 
+Also does PR review-quality enforcement — checks that an Approve/Request
+Changes review actually filled in the required test-report template
+(Environment / Health check / Sorge pass / Manual testing / Automated tests)
+instead of rubber-stamping with a bare "LGTM":
+
+    python3 scripts/pr-qa-planner.py --review-check --repo Team-Deepiri/deepiri-auth-service --pr 74
+    python3 scripts/pr-qa-planner.py --review-check --sweep --all-repos --limit 30
+
 Options:
     --repo OWNER/REPO   Repository to analyze (default: current gh repo).
     --pr NUMBER         PR number (default: PR for the current branch, if any).
@@ -26,19 +34,102 @@ Options:
     --comment           Post the test plan as a comment on the PR.
     --out FILE          Also write the markdown plan to FILE.
     --org NAME          GitHub org owning the repos (default: Team-Deepiri).
+    --deep              Scan a local checkout to find exactly what to test.
+    --skip-setup        Skip the automatic gh CLI install/auth check.
 
-Requires the `gh` CLI authenticated for the org (see
-https://cli.github.com). No other dependencies.
+    --review-check      Check review-submission quality instead of planning.
+    --sweep             (with --review-check) scan recent merged PRs, not one.
+    --all-repos         (with --sweep) scan every repo the QA team reviews.
+    --limit N           (with --sweep) PRs per repo to scan (default: 30).
+    --nudge             (with --review-check) post a PR comment nudging the
+                        reviewer if their review is incomplete.
+
+No manual setup required: on first run this script checks for the `gh` CLI
+and auto-installs it via the platform's package manager if missing, then
+runs `gh auth login` if not authenticated. Stdlib only otherwise.
 """
 import argparse
 import json
 import os
+import platform
 import re
+import shutil
 import subprocess
 import sys
 from collections import defaultdict
 
 ORG = "Team-Deepiri"
+
+
+# ---------------------------------------------------------------------------
+# Dependency auto-setup: no manual "install gh, run gh auth login" steps.
+# ---------------------------------------------------------------------------
+
+def ensure_gh_ready(skip: bool = False) -> None:
+    """Make sure the `gh` CLI is installed and authenticated before we rely on
+    it for everything else in this script."""
+    if skip:
+        return
+    if shutil.which("gh") is None:
+        print("[setup] GitHub CLI ('gh') not found — attempting to install it...",
+              file=sys.stderr)
+        if not _install_gh():
+            raise SystemExit(
+                "Could not auto-install the GitHub CLI for this platform. "
+                "Install it manually: https://cli.github.com then re-run."
+            )
+        if shutil.which("gh") is None:
+            raise SystemExit(
+                "gh installed but isn't on PATH yet — open a new shell "
+                "(or re-source your profile) and re-run this script."
+            )
+    r = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True)
+    if r.returncode != 0:
+        print("[setup] gh CLI is not authenticated — launching `gh auth login`...",
+              file=sys.stderr)
+        login = subprocess.run(["gh", "auth", "login"])
+        if login.returncode != 0:
+            raise SystemExit("`gh auth login` did not complete. Run it manually "
+                             "and re-run this script.")
+
+
+def _install_gh() -> bool:
+    """Best-effort install of the gh CLI via the current platform's package
+    manager. Falls back through managers in order until one works."""
+    system = platform.system()
+    try:
+        if system == "Darwin" and shutil.which("brew"):
+            return subprocess.run(["brew", "install", "gh"]).returncode == 0
+        if system == "Linux":
+            if shutil.which("apt-get"):
+                if subprocess.run(["sudo", "apt-get", "install", "-y", "gh"]).returncode == 0:
+                    return True
+                # Not in the default repos on this release — add the official
+                # apt source (per https://cli.github.com/) and retry.
+                setup = (
+                    "curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg "
+                    "| sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg && "
+                    "sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg && "
+                    'echo "deb [arch=$(dpkg --print-architecture) '
+                    "signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] "
+                    'https://cli.github.com/packages stable main" | '
+                    "sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null && "
+                    "sudo apt-get update && sudo apt-get install -y gh"
+                )
+                return subprocess.run(["bash", "-c", setup]).returncode == 0
+            if shutil.which("dnf"):
+                return subprocess.run(["sudo", "dnf", "install", "-y", "gh"]).returncode == 0
+            if shutil.which("yum"):
+                return subprocess.run(["sudo", "yum", "install", "-y", "gh"]).returncode == 0
+            if shutil.which("pacman"):
+                return subprocess.run(["sudo", "pacman", "-S", "--noconfirm", "github-cli"]).returncode == 0
+            if shutil.which("snap"):
+                return subprocess.run(["sudo", "snap", "install", "gh"]).returncode == 0
+        if system == "Windows" and shutil.which("winget"):
+            return subprocess.run(["winget", "install", "--id", "GitHub.cli"]).returncode == 0
+    except (subprocess.CalledProcessError, OSError):
+        return False
+    return False
 
 # ---------------------------------------------------------------------------
 # Service map: path prefix -> area. In the platform monorepo a submodule bump
@@ -769,6 +860,270 @@ def render_deep(deep: dict) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Review-quality enforcement: did the reviewer actually fill in the required
+# test-report template, or rubber-stamp with a bare "LGTM"?
+# ---------------------------------------------------------------------------
+
+# Repos the QA team reviews — kept in sync with SERVICE_MAP's short names so
+# --all-repos covers the same surface as the test planner does.
+ALL_REPOS = [prefix.rstrip("/").split("/")[-1] for prefix, _, _ in SERVICE_MAP
+             if not prefix.endswith("/")] + ["deepiri-platform"]
+
+# The five sections the review-submission template (see render_markdown's
+# Phase 5) requires, in order. Matching is case-insensitive and tolerant of
+# minor rewording.
+REQUIRED_SECTIONS = [
+    "Environment",
+    "Health check",
+    "Sorge pass",
+    "Manual testing",
+    "Automated tests",
+]
+
+# A section "counts" only if there's real content after the colon — not the
+# literal bracketed placeholder, not empty, and not a filler word that says
+# nothing ("n/a", "done", "ok") with no reason given.
+PLACEHOLDER_RE = re.compile(r"^\[.*\]$")
+EMPTY_FILLER_RE = re.compile(r"^(n/?a|none|done|ok|yes|no|-|—)\.?$", re.IGNORECASE)
+
+FINAL_STATES = {"APPROVED", "CHANGES_REQUESTED"}
+
+
+def fetch_reviews(repo: str, pr: int) -> list[dict]:
+    r = gh("api", f"repos/{repo}/pulls/{pr}/reviews", "--paginate",
+           "--jq", ".[] | {id,user:.user.login,state,body,submitted_at,html_url:.html_url}")
+    if r.returncode != 0:
+        raise RuntimeError(f"gh api repos/{repo}/pulls/{pr}/reviews failed: "
+                           f"{r.stderr.strip()}")
+    reviews = []
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            reviews.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return reviews
+
+
+def evaluate_review(body: str) -> dict:
+    """Check one review body against the required template.
+
+    Returns {"present": {section: text or None}, "missing": [...],
+    "placeholder": [...], "empty_filler": [...], "compliant": bool}
+    """
+    body = body or ""
+    present, missing, placeholder, empty_filler = {}, [], [], []
+    for section in REQUIRED_SECTIONS:
+        m = re.search(rf"^\s*{re.escape(section)}\s*:\s*(.+)$", body,
+                      re.IGNORECASE | re.MULTILINE)
+        if not m:
+            missing.append(section)
+            present[section] = None
+            continue
+        value = m.group(1).strip()
+        present[section] = value
+        if not value or PLACEHOLDER_RE.match(value):
+            placeholder.append(section)
+        elif EMPTY_FILLER_RE.match(value):
+            empty_filler.append(section)
+    compliant = not missing and not placeholder and not empty_filler
+    return {"present": present, "missing": missing, "placeholder": placeholder,
+            "empty_filler": empty_filler, "compliant": compliant}
+
+
+def check_pr_review(repo: str, pr: int) -> dict:
+    reviews = fetch_reviews(repo, pr)
+    final_reviews = [r for r in reviews if r["state"] in FINAL_STATES]
+    comment_only = [r for r in reviews if r["state"] == "COMMENTED"]
+
+    if not final_reviews:
+        return {
+            "repo": repo, "pr": pr, "verdict": "no_final_review",
+            "detail": (f"{len(comment_only)} comment-only review(s), no "
+                       "Approve/Request Changes yet" if comment_only
+                       else "no reviews submitted yet"),
+            "reviews": [],
+        }
+
+    results = []
+    for r in final_reviews:
+        ev = evaluate_review(r["body"])
+        results.append({**r, "eval": ev})
+
+    latest = results[-1]
+    return {
+        "repo": repo, "pr": pr,
+        "verdict": "compliant" if latest["eval"]["compliant"] else "incomplete",
+        "reviews": results,
+    }
+
+
+def render_review_report(result: dict) -> str:
+    lines = [f"### Review quality check — {result['repo']}#{result['pr']}", ""]
+    if result["verdict"] == "no_final_review":
+        lines.append(f"⚠️ {result['detail']}.")
+        return "\n".join(lines)
+
+    for r in result["reviews"]:
+        ev = r["eval"]
+        icon = "✅" if ev["compliant"] else "❌"
+        lines.append(f"{icon} **{r['user']}** — {r['state']} ({r['submitted_at']})")
+        if ev["missing"]:
+            lines.append(f"  - Missing section(s): {', '.join(ev['missing'])}")
+        if ev["placeholder"]:
+            lines.append(f"  - Left as placeholder/empty: {', '.join(ev['placeholder'])}")
+        if ev["empty_filler"]:
+            lines.append(f"  - Filler with no substance (e.g. \"n/a\", \"done\"): "
+                         f"{', '.join(ev['empty_filler'])}")
+        if ev["compliant"]:
+            lines.append("  - All 5 sections present with real content")
+    return "\n".join(lines)
+
+
+NUDGE_TEMPLATE = """Hey @{user} — this review is missing some of the required test-report sections from the [QA review guide]({guide_url}). Could you fill these in before this counts as a final review?
+
+{missing_md}
+
+Template:
+```text
+Environment: [qa-team stack, build vs start]
+Health check: [all containers healthy / issues]
+Sorge pass: [what it flagged, how you handled it]
+Manual testing: [what you exercised, frontend/backend]
+Automated tests: [run / not run, why]
+```
+
+_Automated nudge from `deepiri-suite/scripts/pr-qa-planner.py --review-check`._"""
+
+GUIDE_URL = "https://docs.google.com/document/d/1Qc2XyFIlU9cLuHWbV6GBvM7NLwY2tCGAwdvY6Bcm0PM/edit"
+
+
+def post_review_nudge(repo: str, pr: int, review: dict) -> None:
+    ev = review["eval"]
+    gaps = []
+    if ev["missing"]:
+        gaps.append(f"- Missing entirely: {', '.join(ev['missing'])}")
+    if ev["placeholder"]:
+        gaps.append(f"- Still the template placeholder / empty: {', '.join(ev['placeholder'])}")
+    if ev["empty_filler"]:
+        gaps.append(f"- No real substance: {', '.join(ev['empty_filler'])}")
+    body = NUDGE_TEMPLATE.format(user=review["user"], guide_url=GUIDE_URL,
+                                 missing_md="\n".join(gaps))
+    c = gh("pr", "comment", "--repo", repo, str(pr), "--body", body)
+    if c.returncode != 0:
+        print(f"[warn] failed to post nudge: {c.stderr.strip()}", file=sys.stderr)
+    else:
+        print(f"[posted] nudge comment on {repo}#{pr}", file=sys.stderr)
+
+
+def sweep_repo_reviews(repo: str, limit: int) -> list[dict]:
+    r = gh("pr", "list", "--repo", repo, "--state", "closed",
+           "--limit", str(limit), "--json", "number,mergedAt")
+    if r.returncode != 0:
+        print(f"[warn] skipping {repo}: gh pr list failed: {r.stderr.strip()}",
+              file=sys.stderr)
+        return []
+    try:
+        prs = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        print(f"[warn] skipping {repo}: unparseable PR list", file=sys.stderr)
+        return []
+    results = []
+    for p in prs:
+        if not p.get("mergedAt"):
+            continue
+        try:
+            results.append(check_pr_review(repo, p["number"]))
+        except RuntimeError as e:
+            print(f"[warn] skipping {repo}#{p['number']}: {e}", file=sys.stderr)
+    return results
+
+
+def render_review_sweep_report(results: list[dict], repos: list[str]) -> str:
+    by_reviewer: dict[str, dict] = defaultdict(
+        lambda: {"compliant": 0, "incomplete": 0, "no_final_review": 0})
+    for res in results:
+        if res["verdict"] == "no_final_review":
+            by_reviewer["(unassigned/no review)"]["no_final_review"] += 1
+            continue
+        latest = res["reviews"][-1]
+        by_reviewer[latest["user"]][res["verdict"]] += 1
+
+    lines = [f"## Review quality sweep — {', '.join(repos)}", ""]
+    lines.append(f"- **PRs checked:** {len(results)}")
+    compliant_n = sum(1 for r in results if r["verdict"] == "compliant")
+    incomplete_n = sum(1 for r in results if r["verdict"] == "incomplete")
+    missing_n = sum(1 for r in results if r["verdict"] == "no_final_review")
+    lines.append(f"- **Compliant:** {compliant_n}  ·  **Incomplete:** {incomplete_n}  "
+                 f"·  **No final review found:** {missing_n}")
+    lines.append("")
+    lines.append("| Reviewer | Compliant | Incomplete | No final review | Compliance rate |")
+    lines.append("|----------|-----------|------------|------------------|------------------|")
+    for reviewer, counts in sorted(
+            by_reviewer.items(),
+            key=lambda kv: -(kv[1]["compliant"] + kv[1]["incomplete"] + kv[1]["no_final_review"])):
+        c, i, n = counts["compliant"], counts["incomplete"], counts["no_final_review"]
+        total = c + i
+        rate = f"{100 * c // total}%" if total else "—"
+        lines.append(f"| {reviewer} | {c} | {i} | {n} | {rate} |")
+    lines.append("")
+    if by_reviewer.get("(unassigned/no review)", {}).get("no_final_review"):
+        lines.append("_\"(unassigned/no review)\" = merged PRs with no Approve/Request "
+                     "Changes review at all (e.g. admin-merged, no QA pass)._")
+        lines.append("")
+
+    if incomplete_n:
+        lines.append("### Incomplete reviews — detail")
+        lines.append("")
+        for res in results:
+            if res["verdict"] != "incomplete":
+                continue
+            latest = res["reviews"][-1]
+            ev = latest["eval"]
+            gaps = ev["missing"] + ev["placeholder"] + ev["empty_filler"]
+            lines.append(f"- [{res['repo']}#{res['pr']}]({latest['html_url']}) — "
+                         f"**{latest['user']}**: {', '.join(sorted(set(gaps)))}")
+    return "\n".join(lines)
+
+
+def run_review_check(args) -> None:
+    def full_repo(name: str) -> str:
+        return name if "/" in name else f"{args.org}/{name}"
+
+    if args.sweep or args.all_repos:
+        if not args.all_repos and not args.repo:
+            raise SystemExit("--review-check --sweep needs --repo or --all-repos")
+        repos = [full_repo(r) for r in ALL_REPOS] if args.all_repos else [full_repo(args.repo)]
+        all_results = []
+        for repo in repos:
+            print(f"[scan] {repo} (last {args.limit} merged PRs)...", file=sys.stderr)
+            all_results.extend(sweep_repo_reviews(repo, args.limit))
+        if args.json:
+            print(json.dumps(all_results, indent=2))
+        else:
+            print(render_review_sweep_report(all_results, repos))
+        return
+
+    if not args.repo or not args.pr:
+        raise SystemExit("--review-check needs --repo and --pr (or use --sweep/--all-repos)")
+    repo = full_repo(args.repo)
+    try:
+        result = check_pr_review(repo, args.pr)
+    except RuntimeError as e:
+        raise SystemExit(str(e))
+
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        print(render_review_report(result))
+
+    if args.nudge and result["verdict"] == "incomplete":
+        post_review_nudge(repo, args.pr, result["reviews"][-1])
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -793,7 +1148,26 @@ def main():
     ap.add_argument("--workspace", help="dir to search for local clones "
                                         "(default: $DEEPIRI_QA_WORKSPACE)")
     ap.add_argument("--out", help="write markdown plan to this file")
+    ap.add_argument("--skip-setup", action="store_true",
+                    help="skip the automatic gh CLI install/auth check")
+    ap.add_argument("--review-check", action="store_true",
+                    help="check review-submission quality instead of planning")
+    ap.add_argument("--sweep", action="store_true",
+                    help="(with --review-check) scan recent merged PRs, not one")
+    ap.add_argument("--all-repos", action="store_true",
+                    help="(with --sweep) scan every repo the QA team reviews")
+    ap.add_argument("--limit", type=int, default=30,
+                    help="(with --sweep) PRs per repo to scan (default: 30)")
+    ap.add_argument("--nudge", action="store_true",
+                    help="(with --review-check) post a nudge comment if the "
+                         "review is incomplete")
     args = ap.parse_args()
+
+    ensure_gh_ready(skip=args.skip_setup)
+
+    if args.review_check:
+        run_review_check(args)
+        return
 
     if not args.repo:
         r = gh("repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner")
