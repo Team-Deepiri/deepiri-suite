@@ -357,16 +357,50 @@ def read_os_release() -> dict[str, str]:
     return info
 
 
+# Each package manager writes its own database to a fixed, well-known path
+# the moment it's actually installed and used — checking for that database
+# is real evidence this machine uses it, not a guess about a binary name
+# that merely happens to be on PATH (which a random same-named script could
+# fake). Used as a cross-check against os-release, and as the fallback when
+# os-release is missing or unrecognized (minimal containers, BSDs, etc.).
+_PACKAGE_MANAGER_STATE_PATHS = {
+    "apt-get": ("/var/lib/dpkg/status",),
+    "dnf": ("/var/lib/rpm",),
+    "yum": ("/var/lib/rpm",),
+    "pacman": ("/var/lib/pacman/local",),
+    "zypper": ("/var/lib/zypp",),
+    "apk": ("/lib/apk/db/installed",),
+}
+
+
+def scan_for_package_manager_state() -> str | None:
+    """Which package manager's own database actually exists on this
+    device — real on-disk evidence, checked before ever probing a binary
+    name via PATH."""
+    for manager, paths in _PACKAGE_MANAGER_STATE_PATHS.items():
+        if any(os.path.exists(p) for p in paths):
+            return manager
+    return None
+
+
 def detect_native_package_manager() -> str | None:
-    """The one package manager this specific OS/distro actually declares
-    as its own — macOS/Windows have no equivalent to os-release, but the
-    OS itself is the declaration there (Homebrew is the macOS convention;
-    winget ships with modern Windows)."""
+    """The one package manager this device actually has, found by
+    inspecting the device itself: first the state its package database
+    writes to disk the moment it's really installed (the strongest
+    evidence — can't be faked by an unrelated same-named script), then
+    falling back to the OS's own self-declared identity (os-release ID) if
+    no database is found yet (e.g. a from-scratch system where the
+    database hasn't been touched). macOS/Windows have no os-release or
+    dpkg/rpm-style database — the OS itself is the declaration there
+    (Homebrew is the macOS convention; winget ships with modern Windows)."""
     system = platform.system()
     if system == "Darwin":
         return "brew"
     if system == "Windows":
         return "winget"
+    from_state = scan_for_package_manager_state()
+    if from_state:
+        return from_state
     info = read_os_release()
     ident = f"{info.get('ID', '')} {info.get('ID_LIKE', '')}".lower()
     for family, manager in _DISTRO_FAMILY_MANAGER.items():
@@ -1435,24 +1469,47 @@ _CONTAINER_ENGINE: str | None = None
 _COMPOSE_CMD: str | None = None
 
 
-# Ranked by how likely each is to be what's actually installed today. This
-# list can't be exhaustive forever — whatever containerization tool exists
-# in five years isn't in it — so QA_CONTAINER_ENGINE lets anyone point this
-# at something new without needing a code change.
-# Every container CLI that actually exists in the wild today. Not a
-# preference/assumption — detect_container_engine() searches the device for
-# whichever of these is actually installed rather than assuming any one of
-# them; this list is just what "search the device" is searching *for*, the
-# same way rg_files needs to know "rg" is the ripgrep binary's name.
+# Every container engine writes its own storage/socket state to disk the
+# moment it's actually installed and used — real evidence, not a name
+# probe (a random script named "docker" on PATH can't fake having written
+# Docker's actual storage directory).
+_CONTAINER_ENGINE_STATE_PATHS = {
+    "docker": ("/var/run/docker.sock", "/var/lib/docker",
+              os.path.join(os.path.expanduser("~"), ".docker")),
+    "podman": (os.path.join(os.path.expanduser("~"), ".local/share/containers/storage"),
+              "/var/lib/containers/storage",
+              "/run/podman/podman.sock"),
+    "nerdctl": ("/run/containerd/containerd.sock",),
+    "finch": (os.path.join(os.path.expanduser("~"), ".finch"),),
+}
+
+# What "search the device" falls back to naming when no state evidence
+# exists yet (a freshly installed engine that's never been run) — every
+# container CLI that actually exists in the wild today.
 KNOWN_CONTAINER_ENGINES = ("docker", "podman", "nerdctl", "finch")
 
 
+def scan_for_container_engine_state() -> str | None:
+    """Which container engine actually has real on-disk state on this
+    device — checked before ever probing a binary name via PATH."""
+    for engine, paths in _CONTAINER_ENGINE_STATE_PATHS.items():
+        if any(os.path.exists(p) for p in paths):
+            return engine
+    return None
+
+
 def detect_container_engine() -> str:
-    """Search the device for whichever known container CLI is actually
-    installed, in the order above — no config, no assumption that Docker
-    is the only option."""
+    """Find the container engine this device actually uses: first by its
+    real on-disk state (storage directory, socket — evidence it's actually
+    installed and used), then by falling back to a PATH name check for a
+    freshly-installed engine with no state yet. No config, no assumption
+    that Docker is the only option."""
     global _CONTAINER_ENGINE
     if _CONTAINER_ENGINE is not None:
+        return _CONTAINER_ENGINE
+    from_state = scan_for_container_engine_state()
+    if from_state:
+        _CONTAINER_ENGINE = from_state
         return _CONTAINER_ENGINE
     for engine in KNOWN_CONTAINER_ENGINES:
         if shutil.which(engine):
@@ -3086,6 +3143,14 @@ def run_regression_tests() -> bool:
         globals()["fetch_reviews"] = _real_fetch_reviews
     check("detect_container_engine returns a known engine",
           detect_container_engine() in KNOWN_CONTAINER_ENGINES)
+    check("scan_for_package_manager_state finds real on-disk evidence "
+         "(or None) without crashing",
+          scan_for_package_manager_state() in
+              (None, *_PACKAGE_MANAGER_STATE_PATHS.keys()))
+    check("scan_for_container_engine_state finds real on-disk evidence "
+         "(or None) without crashing",
+          scan_for_container_engine_state() in
+              (None, *_CONTAINER_ENGINE_STATE_PATHS.keys()))
     check("resolve_relative_import resolves a bare relative import",
           "src/db.ts" in resolve_relative_import("src/server.ts", "./db", {".ts"}))
     check("_is_command_carrier rejects prose that merely mentions a `code span`",
