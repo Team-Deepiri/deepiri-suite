@@ -2754,6 +2754,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--out", help="write markdown plan to this file")
     ap.add_argument("--skip-setup", action="store_true",
                     help="skip the automatic gh CLI install/auth check")
+    ap.add_argument("--regression-test", action="store_true",
+                    help="run the built-in regression suite and exit "
+                         "(pure logic checks always; live checks against "
+                         "known PRs if gh is authenticated)")
     ap.add_argument("--interactive", action="store_true",
                     help="launch the QA ASSIST interactive menu")
     ap.add_argument("--plain", action="store_true",
@@ -2893,11 +2897,117 @@ def run_interactive(base_args) -> None:
             run_review_check(args)
 
 
+def run_regression_tests() -> bool:
+    """--regression-test: a fixed suite catching the exact class of
+    regressions found live while building this script this session — bad
+    symbol extraction, broken route parsing, review-quality misclassification,
+    and wrong area/test-command classification against real PRs. Pure-logic
+    checks always run; live checks against known PRs run only if `gh` is
+    authenticated, and are skipped (not failed) if it isn't — this suite
+    shouldn't require network/auth to be useful in CI."""
+    results: list[tuple[str, bool]] = []
+
+    def check(name: str, condition: bool) -> None:
+        results.append((name, bool(condition)))
+        icon = f"{TEAL}PASS{RESET}" if condition else f"{BOLD}FAIL{RESET}"
+        print(f"  [{icon}] {name}", file=sys.stderr)
+
+    print(f"{BOLD}{BLUE}QA ASSIST regression suite{RESET}", file=sys.stderr)
+    print("-- pure logic --", file=sys.stderr)
+
+    check("export-default-function symbol extraction",
+          extract_symbols("export default function Home() {}", "x.tsx") == ["Home"])
+    check("export-default-class symbol extraction",
+          extract_symbols("export default class Foo {}", "x.tsx") == ["Foo"])
+    check("bare export-default identifier symbol extraction",
+          extract_symbols("const Bar = () => null\nexport default Bar\n", "x.tsx") == ["Bar"])
+    check("multi-line route call detected",
+          extract_routes("router.post(\n  \"/x\",", "x.ts") == [("POST", "/x")])
+    check("HTTP_METHODS includes the core verbs",
+          {"get", "post", "put", "delete", "patch"} <= set(HTTP_METHODS))
+    check("review: fully compliant body",
+          evaluate_review("Environment: x\nHealth check: y\nSorge pass: z\n"
+                          "Manual testing: w\nAutomated tests: v")["compliant"])
+    check("review: bare LGTM flagged incomplete",
+          not evaluate_review("LGTM")["compliant"])
+    check("review: template placeholder left in flagged",
+          "Environment" in evaluate_review(
+              "Environment: [qa-team stack, build vs start]\nHealth check: ok\n"
+              "Sorge pass: ok\nManual testing: ok\nAutomated tests: ok")["placeholder"])
+    _real_fetch_reviews = fetch_reviews
+    globals()["fetch_reviews"] = lambda repo, pr: [
+        {"user": "a", "state": "APPROVED", "body": "LGTM",
+         "submitted_at": "t1", "html_url": "u1"},
+        {"user": "a", "state": "APPROVED",
+         "body": "Environment: x\nHealth check: y\nSorge pass: z\n"
+                 "Manual testing: w\nAutomated tests: v",
+         "submitted_at": "t2", "html_url": "u2"},
+    ]
+    try:
+        check("review: a reviewer's later re-review overrides their earlier one",
+              check_pr_review("org/repo", 1)["verdict"] == "compliant")
+    finally:
+        globals()["fetch_reviews"] = _real_fetch_reviews
+    check("detect_container_engine returns a known engine",
+          detect_container_engine() in KNOWN_CONTAINER_ENGINES)
+    check("resolve_relative_import resolves a bare relative import",
+          "src/db.ts" in resolve_relative_import("src/server.ts", "./db", {".ts"}))
+    check("_is_command_carrier rejects prose that merely mentions a `code span`",
+          not _is_command_carrier(
+              "_follows the `deepiri-qa-workflow` skill_", "text"))
+    check("_is_command_carrier accepts a real command bullet",
+          _is_command_carrier("  - `docker logs -f x`", "text"))
+
+    print("-- live checks (real GitHub PRs; skipped if gh isn't authenticated) --",
+         file=sys.stderr)
+    if gh("auth", "status").returncode != 0:
+        print("  [skip] gh not authenticated — live checks skipped", file=sys.stderr)
+    else:
+        try:
+            platform_files = gh_json(
+                "repos/Team-Deepiri/deepiri-platform/pulls/314/files?per_page=100")
+            platform_map = build_service_map("Team-Deepiri/deepiri-platform", ORG)
+            platform_plan = analyze(platform_files, platform_map,
+                                    repo="Team-Deepiri/deepiri-platform")
+            check("platform#314: API Gateway classified with npm test",
+                  "npm test" in platform_plan["areas"]
+                      .get("API Gateway", {}).get("test_command", ""))
+            check("platform#314: Sugar Glider classified with go test (regression: "
+                 "the old hardcoded SERVICE_MAP said pytest — it's actually Go)",
+                  "go test" in platform_plan["areas"]
+                      .get("Sugar Glider (shared)", {}).get("test_command", ""))
+
+            rf_pr = gh_json("repos/Team-Deepiri/deepiri-renderflow-studio/pulls/92")
+            rf_files = gh_json(
+                "repos/Team-Deepiri/deepiri-renderflow-studio/pulls/92/files?per_page=100")
+            rf_map = build_service_map("Team-Deepiri/deepiri-renderflow-studio", ORG)
+            rf_plan = analyze(rf_files, rf_map, repo="Team-Deepiri/deepiri-renderflow-studio",
+                             ref=rf_pr.get("head", {}).get("sha"))
+            check("renderflow-studio#92: classified under its own repo name, "
+                 "not dumped into (unknown / other)",
+                  "Renderflow Studio" in rf_plan["areas"])
+            check("renderflow-studio#92: TypeScript PR gets npm test, not a "
+                 "repo-wide-language misfire",
+                  rf_plan["areas"].get("Renderflow Studio", {}).get("test_command") == "npm test")
+        except RuntimeError as e:
+            print(f"  [skip] live checks failed to fetch: {e}", file=sys.stderr)
+
+    n_pass = sum(1 for _, ok in results if ok)
+    all_ok = n_pass == len(results)
+    print(f"\n{n_pass}/{len(results)} checks passed" +
+         (f" — {BOLD}all green{RESET}" if all_ok else f" — {BOLD}FAILURES ABOVE{RESET}"),
+         file=sys.stderr)
+    return all_ok
+
+
 def main():
     args = build_arg_parser().parse_args()
 
     if not args.json:
         print_banner()
+
+    if args.regression_test:
+        sys.exit(0 if run_regression_tests() else 1)
 
     ensure_gh_ready(skip=args.skip_setup)
     maybe_install_opencode(skip=args.skip_setup)
