@@ -994,11 +994,11 @@ def is_frontend_path(path: str) -> bool:
     return any(hint in low for hint in FRONTEND_PATH_HINTS)
 
 
-def find_service_port(compose_root: str, short_repo: str) -> str | None:
-    """Read the actual host port for a service straight out of the platform's
-    own docker-compose files — no hardcoded port table. Matches on
-    `container_name`, which this platform's compose files consistently set
-    to `<repo-short-name>-dev` for every app service."""
+def find_service_info(compose_root: str, short_repo: str) -> dict | None:
+    """Read a service's real port, container name, and compose service key
+    straight out of the platform's own docker-compose files — no hardcoded
+    port/container table. Matches on `container_name`, which this platform's
+    compose files consistently set to `<repo-short-name>-dev`."""
     for fname in ("docker-compose.dev.yml", "docker-compose.yml"):
         compose_path = os.path.join(compose_root, fname)
         if not os.path.isfile(compose_path):
@@ -1008,16 +1008,24 @@ def find_service_port(compose_root: str, short_repo: str) -> str | None:
                 text = fh.read()
         except OSError:
             continue
-        m = (re.search(rf"container_name:\s*{re.escape(short_repo)}-dev\b", text)
-             or re.search(rf"container_name:\s*{re.escape(short_repo)}\b", text))
+        m = (re.search(rf"container_name:\s*({re.escape(short_repo)}-dev)\b", text)
+             or re.search(rf"container_name:\s*({re.escape(short_repo)})\b", text))
         if not m:
             continue
+        container_name = m.group(1)
+        before = text[:m.start()]
+        key_matches = list(re.finditer(r"\n {2}([\w-]+):\n", before))
+        service_key = key_matches[-1].group(1) if key_matches else short_repo
         rest = text[m.end():]
         next_service = re.search(r"\n {2}\S[^\n]*:\n", rest)
         block = rest[:next_service.start()] if next_service else rest
         port_m = re.search(r'-\s*"?(\d+):(\d+)"?', block)
-        if port_m:
-            return port_m.group(1)
+        return {
+            "service_key": service_key,
+            "container_name": container_name,
+            "port": port_m.group(1) if port_m else None,
+            "compose_file": fname,
+        }
     return None
 
 
@@ -1193,10 +1201,19 @@ def deep_analyze(repo: str, pr: dict, files: list[dict], workspace: str | None) 
 
     cd_path = os.path.relpath(root, os.getcwd()) or "."
     js_runner = detect_js_test_runner(root)
-    # Backend service port: read live from the platform's own docker-compose,
-    # if a local platform checkout is available (no hardcoded port table).
+    # Backend service info (port, container, compose service key): read live
+    # from the platform's own docker-compose, if a local platform checkout
+    # is available — no hardcoded port/container table.
     compose_root = repo_root_hint(f"{repo.split('/')[0]}/deepiri-platform")
-    backend_port = find_service_port(compose_root, short) if compose_root else None
+    service_info = find_service_info(compose_root, short) if compose_root else None
+    backend_port = service_info["port"] if service_info else None
+    docker_commands = []
+    if service_info:
+        docker_commands = [
+            f"docker logs -f {service_info['container_name']}",
+            f"docker exec -it {service_info['container_name']} sh",
+            f"docker compose -f {service_info['compose_file']} restart {service_info['service_key']}",
+        ]
     # Frontend dev-server port: read live from this repo's own package.json/
     # vite config — computed lazily, only if a frontend file actually changed.
     frontend_port = None
@@ -1258,7 +1275,7 @@ def deep_analyze(repo: str, pr: dict, files: list[dict], workspace: str | None) 
         })
 
     return {"available": True, "repo_path": root, "head_sha": head_sha,
-            "files": changed}
+            "files": changed, "docker_commands": docker_commands}
 
 
 def render_deep(deep: dict) -> list[str]:
@@ -1273,6 +1290,11 @@ def render_deep(deep: dict) -> list[str]:
     lines.append(f"_Scanned `{deep.get('repo_path')}` at `{deep.get('head_sha', '')[:8]}` "
                  "— only changed files parsed, references found via ripgrep._")
     lines.append("")
+    if deep.get("docker_commands"):
+        lines.append("- **Service commands (docker):**")
+        for cmd in deep["docker_commands"]:
+            lines.append(f"  - `{cmd}`")
+        lines.append("")
     any_hits = False
     for cf in deep.get("files", []):
         if not (cf["symbols"] or cf["neighbors"] or cf["users"] or cf["tests"]
@@ -1612,6 +1634,105 @@ def _render_report_line(line: dict) -> str:
     return line["raw"]
 
 
+BACKTICK_RE = re.compile(r"`([^`]+)`")
+
+CLIPBOARD_TOOLS = [
+    ["xclip", "-selection", "clipboard"],
+    ["xsel", "--clipboard", "--input"],
+    ["wl-copy"],
+    ["pbcopy"],
+    ["clip.exe"],
+]
+
+
+def copy_to_clipboard(text: str) -> bool:
+    for cmd in CLIPBOARD_TOOLS:
+        if not shutil.which(cmd[0]):
+            continue
+        try:
+            r = subprocess.run(cmd, input=text, text=True, capture_output=True)
+        except OSError:
+            continue
+        if r.returncode == 0:
+            return True
+    return False
+
+
+def _copyable_text(raw: str) -> str:
+    """The command in a line, if it looks like one — prefer the last
+    backtick-fenced span (where curl/docker/test commands live), else the
+    whole line."""
+    codes = BACKTICK_RE.findall(raw)
+    return codes[-1] if codes else raw.strip()
+
+
+def _pick_export_path(stdscr, curses, start_dir: str, default_filename: str) -> str | None:
+    """Inline mini file browser: navigate real directories from start_dir,
+    Enter descends into a folder or (on the save entry) prompts for a
+    filename in the current folder. Esc/q cancels."""
+    cur_dir = os.path.abspath(start_dir)
+    sel = 0
+    while True:
+        try:
+            entries = os.listdir(cur_dir)
+        except OSError:
+            entries = []
+        dirs = sorted(e for e in entries if os.path.isdir(os.path.join(cur_dir, e))
+                     and not e.startswith("."))
+        files = sorted(e for e in entries if not os.path.isdir(os.path.join(cur_dir, e))
+                       and not e.startswith("."))
+        rows = [f"[Save here as {default_filename}]", ".. (up one level)"]
+        rows += [f"{d}/" for d in dirs] + files
+        sel = max(0, min(sel, len(rows) - 1))
+
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        stdscr.addnstr(0, 0, f" Export to — current folder: {cur_dir}", max(0, w - 1),
+                       curses.A_BOLD)
+        for i, row in enumerate(rows):
+            r = i + 2
+            if r >= h - 1:
+                break
+            attr = curses.A_REVERSE if i == sel else curses.A_NORMAL
+            stdscr.addnstr(r, 2, row, max(0, w - 3), attr)
+        footer = " up/down or j/k move   Enter open/select   Esc/q cancel"
+        try:
+            stdscr.addnstr(h - 1, 0, footer[:w - 1], max(0, w - 1), curses.A_DIM)
+        except curses.error:
+            pass
+        stdscr.refresh()
+
+        key = stdscr.getch()
+        if key in (ord("q"), 27):
+            return None
+        if key in (ord("j"), curses.KEY_DOWN):
+            sel = min(sel + 1, len(rows) - 1)
+        elif key in (ord("k"), curses.KEY_UP):
+            sel = max(sel - 1, 0)
+        elif key in (10, 13, curses.KEY_ENTER):
+            choice = rows[sel]
+            if choice.startswith("[Save here"):
+                prompt = f" Filename [{default_filename}]: "
+                stdscr.addnstr(h - 1, 0, prompt, max(0, w - 1))
+                curses.echo()
+                curses.curs_set(1)
+                try:
+                    raw = stdscr.getstr(h - 1, min(len(prompt), w - 1), 80)
+                finally:
+                    curses.curs_set(0)
+                    curses.noecho()
+                name = raw.decode("utf-8", errors="replace").strip() or default_filename
+                return os.path.join(cur_dir, name)
+            if choice == ".. (up one level)":
+                cur_dir = os.path.dirname(cur_dir) or cur_dir
+                sel = 0
+            elif choice.endswith("/"):
+                cur_dir = os.path.join(cur_dir, choice[:-1])
+                sel = 0
+            else:
+                return os.path.join(cur_dir, choice)
+
+
 def run_interactive_report(md: str, export_path: str) -> bool:
     """Curses checklist viewer over the generated plan. Returns True if it
     ran (caller shouldn't also flat-print); False if curses isn't usable
@@ -1622,7 +1743,7 @@ def run_interactive_report(md: str, export_path: str) -> bool:
         return False
 
     lines = _parse_report_lines(md)
-    checkbox_idx = [i for i, l in enumerate(lines) if l["kind"] == "checkbox"]
+    default_filename = os.path.basename(export_path)
 
     def loop(stdscr):
         curses.curs_set(0)
@@ -1636,19 +1757,17 @@ def run_interactive_report(md: str, export_path: str) -> bool:
         checked_attr = curses.color_pair(3)
 
         top = 0
-        cursor = 0 if checkbox_idx else -1
+        cursor = 0  # index into `lines` — moves across every line, not just checkboxes
         status = ""
 
         while True:
             stdscr.erase()
             h, w = stdscr.getmaxyx()
             body_h = max(1, h - 2)
-            cur_line = checkbox_idx[cursor] if cursor >= 0 else -1
-            if cur_line >= 0:
-                if cur_line < top:
-                    top = cur_line
-                elif cur_line >= top + body_h:
-                    top = cur_line - body_h + 1
+            if cursor < top:
+                top = cursor
+            elif cursor >= top + body_h:
+                top = cursor - body_h + 1
 
             for row in range(body_h):
                 li = top + row
@@ -1661,14 +1780,14 @@ def run_interactive_report(md: str, export_path: str) -> bool:
                     attr = header_attr
                 elif line["kind"] == "checkbox":
                     attr = checked_attr if line["checked"] else curses.A_NORMAL
-                    if li == cur_line:
-                        attr |= curses.A_REVERSE
+                if li == cursor:
+                    attr |= curses.A_REVERSE
                 try:
                     stdscr.addnstr(row, 0, text, max(0, w - 1), attr)
                 except curses.error:
                     pass
 
-            footer = (" ↑/↓ or j/k move   space toggle   e export   q quit"
+            footer = (" ↑/↓ or j/k move   space toggle   c copy   e export   q quit"
                      f"   {status}")
             try:
                 stdscr.addnstr(h - 1, 0, footer[:w - 1], max(0, w - 1), teal_attr)
@@ -1680,25 +1799,30 @@ def run_interactive_report(md: str, export_path: str) -> bool:
             if key in (ord("q"), 27):
                 return
             if key in (ord("j"), curses.KEY_DOWN):
-                if checkbox_idx:
-                    cursor = min(cursor + 1, len(checkbox_idx) - 1)
-                else:
-                    top = min(top + 1, max(0, len(lines) - body_h))
+                cursor = min(cursor + 1, len(lines) - 1)
+                status = ""
             elif key in (ord("k"), curses.KEY_UP):
-                if checkbox_idx:
-                    cursor = max(cursor - 1, 0)
-                else:
-                    top = max(top - 1, 0)
+                cursor = max(cursor - 1, 0)
+                status = ""
             elif key in (ord(" "), 10, 13, curses.KEY_ENTER):
-                if cur_line >= 0:
-                    lines[cur_line]["checked"] = not lines[cur_line]["checked"]
+                if lines[cursor]["kind"] == "checkbox":
+                    lines[cursor]["checked"] = not lines[cursor]["checked"]
+            elif key == ord("c"):
+                text_to_copy = _copyable_text(_render_report_line(lines[cursor]))
+                status = (f"[copied: {text_to_copy[:40]}{'...' if len(text_to_copy) > 40 else ''}]"
+                         if copy_to_clipboard(text_to_copy)
+                         else "[no clipboard tool found — install xclip/xsel/wl-copy/pbcopy]")
             elif key == ord("e"):
-                try:
-                    with open(export_path, "w") as f:
-                        f.write("\n".join(_render_report_line(l) for l in lines) + "\n")
-                    status = f"[saved {export_path}]"
-                except OSError as e:
-                    status = f"[save failed: {e}]"
+                chosen = _pick_export_path(stdscr, curses, os.getcwd(), default_filename)
+                if chosen:
+                    try:
+                        with open(chosen, "w") as f:
+                            f.write("\n".join(_render_report_line(l) for l in lines) + "\n")
+                        status = f"[saved {chosen}]"
+                    except OSError as e:
+                        status = f"[save failed: {e}]"
+                else:
+                    status = "[export cancelled]"
 
     curses.wrapper(loop)
     return True
@@ -1725,7 +1849,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--json", action="store_true", help="print plan as JSON")
     ap.add_argument("--comment", action="store_true", help="post plan as PR comment")
     ap.add_argument("--deep", action="store_true",
-                    help="scan local checkout to find exactly what to test")
+                    help="(default on) scan local checkout for exact test "
+                         "commands, curl commands, and visual checks — kept "
+                         "as a no-op flag for backward compatibility")
+    ap.add_argument("--no-deep", action="store_true",
+                    help="skip the local-checkout deep scan (faster, but no "
+                         "curl/visual-check/exact-test-file output)")
     ap.add_argument("--workspace", help="dir to search for local clones "
                                         "(default: $DEEPIRI_QA_WORKSPACE)")
     ap.add_argument("--out", help="write markdown plan to this file")
@@ -1782,7 +1911,7 @@ def run_plan(args) -> None:
         plan["referenced_prs"] = find_referenced_prs(args.repo, pr.get("body") or "",
                                                      pr.get("number", 0))
         plan["submodule_bump_details"] = resolve_submodule_bumps(files, args.org)
-    if args.deep:
+    if not args.no_deep:
         with Spinner("Deep-scanning local checkout..."):
             plan["deep"] = deep_analyze(args.repo, pr, files, args.workspace)
 
@@ -1846,10 +1975,10 @@ def run_interactive(base_args) -> None:
             args.pr = int(pr_in) if pr_in else None
 
         if action == "plan":
-            args.deep = False
+            args.no_deep = True
             run_plan(args)
         elif action == "deep":
-            args.deep = True
+            args.no_deep = False
             run_plan(args)
         elif action == "review":
             args.review_check = True
