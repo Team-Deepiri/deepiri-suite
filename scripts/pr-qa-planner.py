@@ -579,19 +579,111 @@ def guess_test_command_via_language(repo: str) -> str:
     return "manual"
 
 
-def guess_test_command_from_changed_paths(paths: list[str]) -> str:
-    """Guess a test command from the PR's own changed-file extensions —
-    more accurate than a repo-wide GitHub `language` field, which reflects
-    total bytes across the whole repo (misleading for a mixed-language repo
-    where this specific PR only touches one side of it)."""
-    exts = {os.path.splitext(p)[1].lower() for p in paths}
-    if exts & {".ts", ".tsx", ".js", ".jsx"}:
-        return "npm test"
-    if ".py" in exts:
-        return "pytest"
-    if ".go" in exts:
-        return "go test ./..."
-    return "manual"
+_LINGUIST_MAP: dict[str, str] | None = None
+
+# GitHub's own language-classifier data source — the exact list GitHub uses
+# to compute a repo's "Language" stats and green bar. Fetched once and
+# cached instead of hand-typing "which extensions count as JS-like" — the
+# authoritative external source, same idea as sourcing HTTP_METHODS from
+# Python's own http.HTTPMethod enum rather than typing HTTP verbs by hand.
+LINGUIST_LANGUAGES_URL = ("https://raw.githubusercontent.com/github-linguist/"
+                         "linguist/main/lib/linguist/languages.yml")
+
+
+def fetch_linguist_extension_map() -> dict[str, str]:
+    """extension -> language name (e.g. ".ts" -> "TypeScript"), parsed out
+    of Linguist's languages.yml with a tiny stdlib-only scan (no PyYAML
+    dependency) — we only need top-level "LanguageName:" blocks and their
+    "type:"/"extensions:" entries, not the full YAML grammar.
+
+    Some extensions are genuinely ambiguous in Linguist's own data — ".ts"
+    is claimed by both TypeScript (type: programming) and XML (type: data;
+    an old MPEG/translation-file convention) — so only `type: programming`
+    languages are kept here, since that's what determines test tooling;
+    a data/markup/prose format claiming the same extension is irrelevant
+    for "what test command applies"."""
+    global _LINGUIST_MAP
+    if _LINGUIST_MAP is not None:
+        return _LINGUIST_MAP
+    try:
+        req = urllib.request.Request(LINGUIST_LANGUAGES_URL,
+                                     headers={"User-Agent": "pr-qa-planner"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            text = resp.read().decode("utf-8", errors="replace")
+    except (urllib.error.URLError, OSError, TimeoutError):
+        _LINGUIST_MAP = {}
+        return _LINGUIST_MAP
+    mapping: dict[str, str] = {}
+    current_lang = None
+    current_is_programming = False
+    for line in text.splitlines():
+        top_level = re.match(r'^([A-Za-z][^:]*|"[^"]+"):\s*$', line)
+        if top_level:
+            current_lang = top_level.group(1).strip('"')
+            current_is_programming = False
+            continue
+        type_line = re.match(r"^\s+type:\s*(\S+)\s*$", line)
+        if type_line:
+            current_is_programming = type_line.group(1) == "programming"
+            continue
+        if not current_is_programming:
+            continue
+            continue
+        ext_line = re.match(r'^\s+-\s*"?(\.[^"\s]+)"?\s*$', line)
+        if ext_line and current_lang:
+            mapping[ext_line.group(1).lower()] = current_lang
+    _LINGUIST_MAP = mapping
+    return mapping
+
+
+def detect_primary_language(paths: list[str]) -> str | None:
+    """The most common language among the PR's own changed files, per
+    Linguist's extension map — not a repo-wide language field (which
+    reflects total bytes across the whole repo, misleading for a mixed-
+    language repo where this PR only touches one side of it)."""
+    ext_map = fetch_linguist_extension_map()
+    if not ext_map:
+        return None
+    langs = [ext_map[os.path.splitext(p)[1].lower()] for p in paths
+            if os.path.splitext(p)[1].lower() in ext_map]
+    if not langs:
+        return None
+    return max(set(langs), key=langs.count)
+
+
+# The only genuinely hand-authored mapping left: which *test tool* a
+# language's ecosystem conventionally uses. This is tooling convention, not
+# a fact derivable from a language-classification source — there's no
+# external authority for "how do TypeScript projects usually run tests"
+# the way Linguist is one for "which extension is which language".
+TEST_COMMAND_BY_LANGUAGE = {
+    "JavaScript": "npm test", "TypeScript": "npm test",
+    "TSX": "npm test", "JSX": "npm test",
+    "Python": "pytest",
+    "Go": "go test ./...",
+}
+
+
+def guess_test_command_from_changed_paths(paths: list[str], repo: str | None = None,
+                                          ref: str | None = None) -> str:
+    """The real test command, read from the repo's own config when possible
+    — package.json's actual `scripts.test` (the same signal
+    detect_js_test_runner uses locally, fetched remotely here since this
+    path runs when there's no local checkout) — falling back to the
+    language Linguist detects among the PR's own changed files (see
+    detect_primary_language) only when that config can't be read."""
+    lang = detect_primary_language(paths)
+    if repo and ref and TEST_COMMAND_BY_LANGUAGE.get(lang) == "npm test":
+        pkg = fetch_repo_file_remote(repo, ref, "package.json")
+        if pkg:
+            try:
+                test_script = (json.loads(pkg).get("scripts", {}) or {}).get("test")
+            except json.JSONDecodeError:
+                test_script = None
+            # package.json exists and we can see whether it declares a real
+            # test script — trust that over guessing, in both directions.
+            return "npm test" if test_script else "manual"
+    return TEST_COMMAND_BY_LANGUAGE.get(lang, "manual")
 
 
 def build_service_map_from_gitmodules(repo: str) -> list[tuple[str, str, str]]:
@@ -824,7 +916,8 @@ def find_related_prs(repo: str, head_ref: str, exclude_number: int = 0) -> list[
 
 
 def analyze(files: list[dict], service_map: list[tuple[str, str, str]],
-            repo: str | None = None, changed_files_before: int = 0) -> dict:
+            repo: str | None = None, ref: str | None = None,
+            changed_files_before: int = 0) -> dict:
     """Build the plan model from the PR's changed files."""
     areas: dict[str, dict] = defaultdict(
         lambda: {"files": [], "additions": 0, "deletions": 0}
@@ -849,7 +942,7 @@ def analyze(files: list[dict], service_map: list[tuple[str, str, str]],
     if repo and not service_map:
         short = repo.split("/")[-1]
         whole_repo_label = prettify_service_name(short)
-        whole_repo_cmd = guess_test_command_from_changed_paths(all_paths)
+        whole_repo_cmd = guess_test_command_from_changed_paths(all_paths, repo, ref)
 
     for f in files:
         label, cmd = classify_path(f["filename"], service_map)
@@ -2705,7 +2798,7 @@ def run_plan(args) -> None:
 
     with Spinner("Building service map (dtm / .gitmodules)..."):
         service_map = build_service_map(args.repo, args.org)
-    plan = analyze(files, service_map, repo=args.repo)
+    plan = analyze(files, service_map, repo=args.repo, ref=pr.get("head", {}).get("sha"))
     plan["pr_url"] = pr.get("html_url")
     plan["repo"] = args.repo
     with Spinner("Checking cross-PR references and submodule bumps..."):
