@@ -61,6 +61,7 @@ import subprocess
 import sys
 import threading
 import time
+import webbrowser
 from collections import defaultdict
 
 ORG = "Team-Deepiri"
@@ -1884,6 +1885,121 @@ def synthesize_ai_prompt(lines: list[dict]) -> str:
     return AI_AGENT_PROMPT_TEMPLATE.format(plan_body=plan_body)
 
 
+URL_RE = re.compile(r"https?://\S+")
+
+
+def _extract_url(raw: str) -> str | None:
+    m = URL_RE.search(raw)
+    return m.group(0).rstrip(").,'\"") if m else None
+
+
+def _run_shell_capture(cmd: str, timeout: int = 30) -> tuple[int, str]:
+    try:
+        r = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True,
+                           timeout=timeout)
+        return r.returncode, (r.stdout or "") + (r.stderr or "")
+    except subprocess.TimeoutExpired:
+        return -1, f"[timed out after {timeout}s — command may still be running in the background]"
+    except OSError as e:
+        return -1, f"[failed to launch: {e}]"
+
+
+def _show_output_pane(stdscr, curses, title: str, output: str, teal_attr) -> None:
+    """Scrollable pane showing captured command output inline in the same
+    terminal — this is the "visualize the output" ask: results appear right
+    here, not in a separate window/terminal."""
+    out_lines = output.splitlines() or ["(no output)"]
+    top = 0
+    while True:
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        stdscr.addnstr(0, 0, f" {title}", max(0, w - 1), curses.A_BOLD)
+        body_h = max(1, h - 2)
+        for row in range(body_h):
+            li = top + row
+            if li >= len(out_lines):
+                break
+            try:
+                stdscr.addnstr(row + 1, 0, out_lines[li], max(0, w - 1))
+            except curses.error:
+                pass
+        footer = " up/down or j/k scroll   any other key: continue"
+        try:
+            stdscr.addnstr(h - 1, 0, footer[:w - 1], max(0, w - 1), teal_attr)
+        except curses.error:
+            pass
+        stdscr.refresh()
+        key = stdscr.getch()
+        if key in (curses.KEY_DOWN, ord("j")):
+            top = min(top + 1, max(0, len(out_lines) - body_h))
+        elif key in (curses.KEY_UP, ord("k")):
+            top = max(top - 1, 0)
+        else:
+            return
+
+
+def run_guided_walkthrough(stdscr, curses, lines: list[dict], teal_attr) -> None:
+    """Step through every actionable line one at a time: run its command
+    inline (output shown in the same terminal, not a separate window), open
+    a browser tab for anything with a URL (visual checks), or just mark a
+    checklist item done, then move on. This is the "walk me through testing
+    this PR" ask."""
+    actionable = [i for i, l in enumerate(lines)
+                 if l["kind"] == "checkbox" or BACKTICK_RE.search(l["raw"])
+                 or URL_RE.search(l["raw"])]
+    if not actionable:
+        return
+    idx = 0
+    while 0 <= idx < len(actionable):
+        li = actionable[idx]
+        line = lines[li]
+        raw = _render_report_line(line)
+        cmd = _copyable_text(raw)
+        is_runnable = bool(BACKTICK_RE.search(raw)) and not cmd.lower().startswith(("http://", "https://"))
+        url = _extract_url(raw)
+
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        stdscr.addnstr(0, 0, f" Guided walkthrough — step {idx + 1}/{len(actionable)}",
+                       max(0, w - 1), curses.A_BOLD)
+        for i, chunk_start in enumerate(range(0, max(len(raw), 1), max(1, w - 4))):
+            if i + 2 >= h - 2:
+                break
+            stdscr.addnstr(i + 2, 2, raw[chunk_start:chunk_start + w - 4], max(0, w - 4))
+
+        opts = []
+        if line["kind"] == "checkbox":
+            opts.append("space: mark done")
+        if is_runnable:
+            opts.append("r: run this command")
+        if url:
+            opts.append("o: open in browser")
+        opts += ["n: next", "b: back", "q: exit walkthrough"]
+        try:
+            stdscr.addnstr(h - 1, 0, "   ".join(opts)[:w - 1], max(0, w - 1), teal_attr)
+        except curses.error:
+            pass
+        stdscr.refresh()
+
+        key = stdscr.getch()
+        if key == ord("q"):
+            return
+        if key == ord("n"):
+            idx += 1
+        elif key == ord("b"):
+            idx = max(0, idx - 1)
+        elif key in (ord(" "), 10, 13, curses.KEY_ENTER) and line["kind"] == "checkbox":
+            line["checked"] = not line["checked"]
+        elif key == ord("r") and is_runnable:
+            rc, output = _run_shell_capture(cmd)
+            _show_output_pane(stdscr, curses, f"$ {cmd}   (exit {rc})", output, teal_attr)
+        elif key == ord("o") and url:
+            try:
+                webbrowser.open(url)
+            except Exception:
+                pass
+
+
 def _pick_export_path(stdscr, curses, start_dir: str, default_filename: str) -> str | None:
     """Inline mini file browser: navigate real directories from start_dir,
     Enter descends into a folder or (on the save entry) prompts for a
@@ -2006,7 +2122,7 @@ def run_interactive_report(md: str, export_path: str) -> bool:
                     pass
 
             footer = (" ↑/↓ or j/k move   space toggle   c copy   p AI prompt"
-                     f"   e export   q quit   {status}")
+                     f"   w walkthrough   e export   q quit   {status}")
             try:
                 stdscr.addnstr(h - 1, 0, footer[:w - 1], max(0, w - 1), teal_attr)
             except curses.error:
@@ -2045,6 +2161,9 @@ def run_interactive_report(md: str, export_path: str) -> bool:
                             status = f"[save failed: {e}]"
                     else:
                         status = "[no clipboard tool found, and export cancelled]"
+            elif key == ord("w"):
+                run_guided_walkthrough(stdscr, curses, lines, teal_attr)
+                status = "[walkthrough ended]"
             elif key == ord("e"):
                 chosen = _pick_export_path(stdscr, curses, os.getcwd(), default_filename)
                 if chosen:
