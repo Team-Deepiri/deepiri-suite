@@ -135,44 +135,37 @@ def _install_gh() -> bool:
 # Service map: path prefix -> area. In the platform monorepo a submodule bump
 # (a one-line gitlink diff) means "this sub-service changed"; a path under a
 # service's tree means the change lives inside that service repo directly.
+#
+# This used to be a hand-maintained list of every repo + its test command —
+# which silently goes stale the moment a service is added, renamed, or moves.
+# Instead we source it live, in priority order:
+#
+#   1. dtm (deepiri-pkg-version-manager) — if installed (auto-installed below
+#      if missing), `dtm scan` builds a real dependency graph of the local
+#      platform checkout: exact repo_path, package_type (npm/poetry/pip) per
+#      package. This is the most precise source and needs no guessing.
+#   2. .gitmodules + GitHub repo language — works from anywhere with zero
+#      local checkout (fetched via the GitHub API), for CI or a machine that
+#      doesn't have deepiri-platform cloned. Less precise (language-based
+#      guess at the test command instead of dtm's exact package_type).
+#
+# (deepiri-vizult was also considered — it maps runtime service topology from
+# docker-compose/k8s/source scanning, which is the right tool for "what talks
+# to what", not "which repo does this path belong to". dtm's package/path
+# registry is the closer fit for this script's needs.)
 # ---------------------------------------------------------------------------
 
-# Prefix -> (area label, test_command). Command is a suggestion; QA should
-# adapt to the actual repo's setup.
-SERVICE_MAP = [
-    # -- platform monorepo: backend services
-    ("platform-services/backend/deepiri-api-gateway", "API Gateway", "cd platform-services/backend/deepiri-api-gateway && npm test"),
-    ("platform-services/backend/deepiri-auth-service", "Auth Service", "cd platform-services/backend/deepiri-auth-service && npm test"),
-    ("platform-services/backend/deepiri-language-intelligence-service", "Language Intelligence", "cd platform-services/backend/deepiri-language-intelligence-service && npm test"),
-    ("platform-services/backend/deepiri-external-bridge-service", "External Bridge", "cd platform-services/backend/deepiri-external-bridge-service && npm test"),
-    ("platform-services/backend/deepiri-messaging-service", "Messaging Service", "cd platform-services/backend/deepiri-messaging-service && npm test"),
-    ("platform-services/backend/deepiri-realtime-gateway", "Realtime Gateway", "cd platform-services/backend/deepiri-realtime-gateway && npm test"),
-    ("platform-services/backend/deepiri-telemetry", "Telemetry", "cd platform-services/backend/deepiri-telemetry && npm test"),
-    ("platform-services/backend/deepiri-registry", "Registry", "cd platform-services/backend/deepiri-registry && npm test"),
-    ("platform-services/backend/deepiri-jobs", "Jobs", "cd platform-services/backend/deepiri-jobs && npm test"),
-    ("platform-services/backend/deepiri-truss", "Truss", "cd platform-services/backend/deepiri-truss && npm test"),
-    ("platform-services/backend/deepiri-speech", "Speech", "cd platform-services/backend/deepiri-speech && npm test"),
-    ("platform-services/backend/deepiri-workflow-orchestrator", "Workflow Orchestrator", "cd platform-services/backend/deepiri-workflow-orchestrator && npm test"),
-    ("platform-services/backend/deepiri-communications-hub", "Communications Hub", "cd platform-services/backend/deepiri-communications-hub && npm test"),
-    ("platform-services/backend/deepiri-decision-intelligence", "Decision Intelligence", "cd platform-services/backend/deepiri-decision-intelligence && npm test"),
-    ("platform-services/backend/deepiri-adaptive-experience-engine", "Adaptive Experience", "cd platform-services/backend/deepiri-adaptive-experience-engine && npm test"),
-    ("platform-services/backend/deepiri-incentive-engine", "Incentive Engine", "cd platform-services/backend/deepiri-incentive-engine && npm test"),
-    # -- platform monorepo: shared libraries
-    ("platform-services/shared/deepiri-prismpipe", "PrismPipe (shared)", "cd platform-services/shared/deepiri-prismpipe && pytest"),
-    ("platform-services/shared/deepiri-synapse", "Synapse (shared)", "cd platform-services/shared/deepiri-synapse && pytest"),
-    ("platform-services/shared/deepiri-sugar-glider", "Sugar Glider (shared)", "cd platform-services/shared/deepiri-sugar-glider && pytest"),
-    ("platform-services/shared/deepiri-shared-utils", "Shared Utils", "cd platform-services/shared/deepiri-shared-utils && npm test"),
-    # -- platform monorepo: top-level submodule repos
-    ("deepiri-web-frontend", "Web Frontend", "cd deepiri-web-frontend && npm test"),
-    ("deepiri-modelkit", "Modelkit", "cd deepiri-modelkit && pytest"),
-    ("deepiri-logger", "Logger", "cd deepiri-logger && pytest"),
-    ("deepiri-ollama-utils", "Ollama Utils", "cd deepiri-ollama-utils && pytest"),
-    ("deepiri-core-api", "Core API", "cd deepiri-core-api && pytest"),
-    ("diri-cyrex", "Cyrex", "cd diri-cyrex && pytest"),
-    ("diri-helox", "Helox", "cd diri-helox && pytest"),
-    ("diri-persola", "Persola", "cd diri-persola && pytest"),
-    ("deepiri-suite", "Deepiri Suite (toolchain)", "cd deepiri-suite && docker build ."),
-    # -- platform monorepo: infrastructure and tooling
+TEST_CMD_BY_TYPE = {
+    "npm": "npm test",
+    "poetry": "poetry run pytest",
+    "pip": "pytest",
+}
+
+# Paths that are monorepo structure, not a versioned package dtm would know
+# about — kept as a small fixed list since these aren't "services" in the
+# sense Joe's comment was about (nothing here duplicates a repo/test-command
+# registry that could go stale).
+LOCAL_INFRA_PATHS = [
     ("deploy/", "Deployment/K8s", "helm lint + kubectl apply --dry-run=client"),
     ("ops/", "Ops", "cd ops && make lint"),
     ("skaffold/", "Skaffold", "skaffold render --validate"),
@@ -180,6 +173,193 @@ SERVICE_MAP = [
     ("scripts/", "Repo Scripts", "python3 -m py_compile <changed scripts>"),
     (".github/workflows/", "CI Workflows", "PR CI run"),
 ]
+
+
+def get_dtm_db_path() -> "os.PathLike":
+    return os.path.join(os.path.expanduser("~"), ".deepiri", "dtm.db")
+
+
+def ensure_dtm_ready(skip: bool = False) -> bool:
+    """Best-effort install of dtm (deepiri-pkg-version-manager) — the live
+    dependency-graph tool that replaces a hand-maintained service map.
+    Non-fatal: returns False so callers fall back to the .gitmodules path."""
+    if skip:
+        return False
+    if shutil.which("dtm"):
+        return True
+    print("[setup] dtm (deepiri-pkg-version-manager) not found — attempting "
+          "to install it...", file=sys.stderr)
+    cache_dir = os.path.join(os.path.expanduser("~"), ".deepiri",
+                             "deepiri-pkg-version-manager")
+    try:
+        if not os.path.isdir(cache_dir):
+            r = subprocess.run(
+                ["git", "clone", "--depth", "1",
+                 f"https://github.com/{ORG}/deepiri-pkg-version-manager.git", cache_dir],
+                capture_output=True, text=True)
+            if r.returncode != 0:
+                print(f"[warn] could not clone dtm: {r.stderr.strip()}", file=sys.stderr)
+                return False
+        if not _pip_install_cli(cache_dir, "dtm"):
+            return False
+    except OSError as e:
+        print(f"[warn] dtm setup failed: {e}", file=sys.stderr)
+        return False
+    if shutil.which("dtm") is None:
+        print("[warn] dtm installed but not on PATH — open a new shell (or "
+              "re-source your profile) and re-run, or fall back to .gitmodules.",
+              file=sys.stderr)
+        return False
+    return True
+
+
+def _pip_install_cli(source_dir: str, binary_name: str) -> bool:
+    """Install a local Python package as an isolated CLI tool. Modern Debian/
+    Ubuntu's system Python refuses `pip install --user` (PEP 668 "externally
+    managed environment"), so prefer pipx — it's built exactly for this
+    (isolated venv per tool, puts the binary on PATH) — and fall back through
+    plain --user pip, then --user --break-system-packages as a last resort."""
+    if shutil.which("pipx"):
+        r = subprocess.run(["pipx", "install", source_dir],
+                           capture_output=True, text=True)
+        if r.returncode == 0:
+            return True
+        print(f"[warn] pipx install failed, trying pip: {r.stderr.strip()}",
+              file=sys.stderr)
+    r = subprocess.run([sys.executable, "-m", "pip", "install", "--user", "-e", source_dir],
+                       capture_output=True, text=True)
+    if r.returncode == 0:
+        return True
+    if "externally-managed-environment" in (r.stderr or ""):
+        print("[setup] system Python is externally managed — retrying with "
+              "--break-system-packages (installs into --user site, not system)...",
+              file=sys.stderr)
+        r = subprocess.run([sys.executable, "-m", "pip", "install", "--user",
+                            "--break-system-packages", "-e", source_dir],
+                           capture_output=True, text=True)
+        if r.returncode == 0:
+            return True
+    print(f"[warn] could not install {binary_name}: {r.stderr.strip()}", file=sys.stderr)
+    return False
+
+
+def query_dtm_packages() -> list[dict]:
+    """Read dtm's live dependency-graph DB instead of a hardcoded list."""
+    db_path = get_dtm_db_path()
+    if not os.path.isfile(db_path):
+        return []
+    import sqlite3
+    try:
+        con = sqlite3.connect(db_path)
+        cur = con.cursor()
+        cur.execute("SELECT name, repo_path, package_type, git_url, is_submodule "
+                    "FROM dependencies")
+        rows = cur.fetchall()
+        con.close()
+    except sqlite3.Error:
+        return []
+    return [{"name": r[0], "repo_path": r[1], "type": r[2], "git_url": r[3],
+             "is_submodule": bool(r[4])} for r in rows]
+
+
+def prettify_service_name(short: str) -> str:
+    name = re.sub(r"^(deepiri-|diri-)", "", short)
+    acronyms = {"api", "ai", "ml", "ui", "db", "cli"}
+    return " ".join(w.upper() if w in acronyms else w.capitalize()
+                    for w in name.split("-"))
+
+
+def build_service_map_from_dtm(platform_root: str) -> list[tuple[str, str, str]] | None:
+    """(path_prefix, area_label, test_command) triples from a live dtm scan
+    of the local platform checkout. Returns None if dtm isn't usable here."""
+    if not ensure_dtm_ready():
+        return None
+    r = subprocess.run(["dtm", "scan", "--path", platform_root],
+                       capture_output=True, text=True, timeout=120)
+    if r.returncode != 0:
+        print(f"[warn] dtm scan failed: {r.stderr.strip()}", file=sys.stderr)
+        return None
+    packages = query_dtm_packages()
+    if not packages:
+        return None
+    entries = []
+    for p in packages:
+        if not p["is_submodule"] or not p["repo_path"]:
+            continue
+        try:
+            rel = os.path.relpath(p["repo_path"], platform_root)
+        except ValueError:
+            continue
+        if rel.startswith(".."):
+            continue
+        short = (p["git_url"] or p["name"]).rstrip("/").split("/")[-1].removesuffix(".git")
+        label = prettify_service_name(short)
+        if "shared" in rel:
+            label += " (shared)"
+        cmd = TEST_CMD_BY_TYPE.get(p["type"], "manual")
+        entries.append((rel, label, f"cd {rel} && {cmd}"))
+    return entries or None
+
+
+def fetch_gitmodules_text(org: str) -> str | None:
+    """Fetch deepiri-platform's .gitmodules via the GitHub API — works with
+    no local checkout, still a live read instead of a hardcoded list."""
+    r = gh("api", f"repos/{org}/deepiri-platform/contents/.gitmodules",
+           "--jq", ".content")
+    if r.returncode != 0 or not r.stdout.strip():
+        return None
+    import base64
+    try:
+        return base64.b64decode(r.stdout.strip()).decode("utf-8", errors="replace")
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+
+def guess_test_command_via_language(repo: str) -> str:
+    r = gh("api", f"repos/{repo}", "--jq", ".language")
+    lang = (r.stdout or "").strip().strip('"').lower() if r.returncode == 0 else ""
+    if lang == "python":
+        return "pytest"
+    if lang in ("typescript", "javascript"):
+        return "npm test"
+    if lang == "go":
+        return "go test ./..."
+    return "manual"
+
+
+def build_service_map_from_gitmodules(org: str) -> list[tuple[str, str, str]]:
+    """Fallback when dtm isn't available/installable: parse .gitmodules for
+    path->repo, then guess the test command from the repo's GitHub language.
+    Still fully dynamic — no per-repo list to maintain by hand."""
+    text = fetch_gitmodules_text(org)
+    if not text:
+        return []
+    entries = []
+    for block in re.split(r"\[submodule ", text)[1:]:
+        pm = re.search(r"path\s*=\s*(\S+)", block)
+        um = re.search(r"url\s*=\s*(\S+)", block)
+        if not (pm and um):
+            continue
+        path = pm.group(1).strip()
+        short = um.group(1).strip().rstrip("/").split("/")[-1].removesuffix(".git")
+        label = prettify_service_name(short)
+        if path.startswith("platform-services/shared/"):
+            label += " (shared)"
+        cmd = guess_test_command_via_language(f"{org}/{short}")
+        entries.append((path, label, f"cd {path} && {cmd}"))
+    return entries
+
+
+def build_service_map(org: str) -> list[tuple[str, str, str]]:
+    """The live path->(area, test command) map used by classify_path, built
+    fresh each run instead of hand-maintained. Tries dtm first (precise),
+    falls back to .gitmodules + language guess (works anywhere)."""
+    platform_root = repo_root_hint(f"{org}/deepiri-platform")
+    if platform_root:
+        from_dtm = build_service_map_from_dtm(platform_root)
+        if from_dtm:
+            return from_dtm
+    return build_service_map_from_gitmodules(org)
 
 # Risk-signal keyword -> (flag, QA guidance)
 RISK_RULES = [
@@ -228,10 +408,13 @@ def gh_json(path: str) -> dict:
 # Classification
 # ---------------------------------------------------------------------------
 
-def classify_path(path: str) -> tuple[str, str]:
+def classify_path(path: str, service_map: list[tuple[str, str, str]]) -> tuple[str, str]:
     """Return (area_label, test_command) for a path, or (None, None) if unknown."""
     low = path.lower()
-    for prefix, label, cmd in SERVICE_MAP:
+    for prefix, label, cmd in service_map:
+        if low.startswith(prefix.lower()):
+            return label, cmd
+    for prefix, label, cmd in LOCAL_INFRA_PATHS:
         if low.startswith(prefix):
             return label, cmd
     return None, None
@@ -360,7 +543,8 @@ def find_related_prs(repo: str, head_ref: str, exclude_number: int = 0) -> list[
         return []
 
 
-def analyze(files: list[dict], changed_files_before: int = 0) -> dict:
+def analyze(files: list[dict], service_map: list[tuple[str, str, str]],
+            changed_files_before: int = 0) -> dict:
     """Build the plan model from the PR's changed files."""
     areas: dict[str, dict] = defaultdict(
         lambda: {"files": [], "additions": 0, "deletions": 0}
@@ -374,7 +558,7 @@ def analyze(files: list[dict], changed_files_before: int = 0) -> dict:
     ) or bool(submodule_bumps)
 
     for f in files:
-        label, cmd = classify_path(f["filename"])
+        label, cmd = classify_path(f["filename"], service_map)
         area = areas[label] if label else areas["(unknown / other)"]
         area["files"].append(f["filename"])
         area["additions"] += f.get("additions", 0)
@@ -864,10 +1048,19 @@ def render_deep(deep: dict) -> list[str]:
 # test-report template, or rubber-stamp with a bare "LGTM"?
 # ---------------------------------------------------------------------------
 
-# Repos the QA team reviews — kept in sync with SERVICE_MAP's short names so
-# --all-repos covers the same surface as the test planner does.
-ALL_REPOS = [prefix.rstrip("/").split("/")[-1] for prefix, _, _ in SERVICE_MAP
-             if not prefix.endswith("/")] + ["deepiri-platform"]
+def discover_org_repos(org: str) -> list[str]:
+    """Every repo in the org, live — no hardcoded list to fall out of sync
+    when a repo is added, renamed, or archived."""
+    r = gh("repo", "list", org, "--json", "name", "--limit", "300",
+           "--no-archived")
+    if r.returncode != 0:
+        print(f"[warn] could not list repos for {org}: {r.stderr.strip()}",
+              file=sys.stderr)
+        return []
+    try:
+        return sorted(x["name"] for x in json.loads(r.stdout))
+    except json.JSONDecodeError:
+        return []
 
 # The five sections the review-submission template (see render_markdown's
 # Phase 5) requires, in order. Matching is case-insensitive and tolerant of
@@ -1095,7 +1288,8 @@ def run_review_check(args) -> None:
     if args.sweep or args.all_repos:
         if not args.all_repos and not args.repo:
             raise SystemExit("--review-check --sweep needs --repo or --all-repos")
-        repos = [full_repo(r) for r in ALL_REPOS] if args.all_repos else [full_repo(args.repo)]
+        repos = ([full_repo(r) for r in discover_org_repos(args.org)]
+                if args.all_repos else [full_repo(args.repo)])
         all_results = []
         for repo in repos:
             print(f"[scan] {repo} (last {args.limit} merged PRs)...", file=sys.stderr)
@@ -1189,7 +1383,8 @@ def main():
             break
         page += 1
 
-    plan = analyze(files)
+    service_map = build_service_map(args.org)
+    plan = analyze(files, service_map)
     plan["pr_url"] = pr.get("html_url")
     plan["repo"] = args.repo
     plan["referenced_prs"] = find_referenced_prs(args.repo, pr.get("body") or "",
