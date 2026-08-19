@@ -59,9 +59,15 @@ import re
 import shutil
 import subprocess
 import sys
+import io
+import tarfile
+import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 import webbrowser
+import zipfile
 from collections import defaultdict
 
 ORG = "Team-Deepiri"
@@ -201,6 +207,106 @@ def ensure_gh_ready(skip: bool = False) -> None:
                              "and re-run this script.")
 
 
+# ---------------------------------------------------------------------------
+# Better than guessing package managers: for a tool that publishes official
+# prebuilt binaries on GitHub Releases, download the right one directly —
+# no apt/dnf/pacman/brew/winget knowledge needed at all, works identically
+# on any OS/distro, no sudo required (installs into the user's own bin dir).
+# This is the primary install path; the package-manager table below is only
+# a fallback for when this can't run (offline, rate-limited, no matching
+# release asset).
+# ---------------------------------------------------------------------------
+
+def _os_arch_tags() -> tuple[list[str], list[str]]:
+    """Tokens likely to appear in a release asset name for this OS/CPU —
+    derived live from platform.system()/platform.machine(), not a fixed
+    per-tool table."""
+    system = platform.system().lower()
+    os_tags = {
+        "linux": ["linux"],
+        "darwin": ["darwin", "macos", "apple"],
+        "windows": ["windows", "win"],
+    }.get(system, [system])
+    machine = platform.machine().lower()
+    if machine in ("x86_64", "amd64"):
+        arch_tags = ["x86_64", "amd64", "x64"]
+    elif machine in ("arm64", "aarch64"):
+        arch_tags = ["arm64", "aarch64"]
+    else:
+        arch_tags = [machine]
+    return os_tags, arch_tags
+
+
+def _pick_release_asset(assets: list[dict]) -> dict | None:
+    os_tags, arch_tags = _os_arch_tags()
+    candidates = [a for a in assets
+                 if any(t in a["name"].lower() for t in os_tags)
+                 and any(t in a["name"].lower() for t in arch_tags)
+                 and a["name"].lower().endswith((".tar.gz", ".tgz", ".zip"))]
+    # musl/static builds are the safest bet on an unknown Linux distro
+    # (no glibc-version assumptions) — prefer them when present.
+    if platform.system().lower() == "linux":
+        musl = [a for a in candidates if "musl" in a["name"].lower()]
+        if musl:
+            return musl[0]
+    return candidates[0] if candidates else None
+
+
+def install_from_github_release(gh_repo: str, binary_name: str, dest_dir: str | None = None) -> bool:
+    """Fetch the latest release of `gh_repo` and install whichever binary
+    inside matches `binary_name` for this OS/arch. Uses urllib directly
+    (not the `gh` CLI) since this may be called to install `gh` itself."""
+    dest_dir = dest_dir or os.path.join(os.path.expanduser("~"), ".local", "bin")
+    try:
+        req = urllib.request.Request(
+            f"https://api.github.com/repos/{gh_repo}/releases/latest",
+            headers={"User-Agent": "pr-qa-planner", "Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            release = json.loads(resp.read().decode())
+    except (urllib.error.URLError, OSError, json.JSONDecodeError, TimeoutError):
+        return False
+    asset = _pick_release_asset(release.get("assets", []))
+    if not asset:
+        return False
+    try:
+        req = urllib.request.Request(asset["browser_download_url"],
+                                     headers={"User-Agent": "pr-qa-planner"})
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            blob = resp.read()
+    except (urllib.error.URLError, OSError, TimeoutError):
+        return False
+
+    target_name = binary_name + (".exe" if platform.system() == "Windows" else "")
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            if asset["name"].endswith(".zip"):
+                with zipfile.ZipFile(io.BytesIO(blob)) as zf:
+                    zf.extractall(tmp)
+            else:
+                with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tf:
+                    tf.extractall(tmp)
+        except (zipfile.BadZipFile, tarfile.TarError, OSError):
+            return False
+        found = None
+        for dirpath, _dirs, filenames in os.walk(tmp):
+            if target_name in filenames:
+                found = os.path.join(dirpath, target_name)
+                break
+        if not found:
+            return False
+        os.makedirs(dest_dir, exist_ok=True)
+        dest_path = os.path.join(dest_dir, target_name)
+        try:
+            shutil.copy2(found, dest_path)
+            os.chmod(dest_path, 0o755)
+        except OSError:
+            return False
+    if dest_dir not in os.environ.get("PATH", "").split(os.pathsep):
+        print(f"[setup] installed to {dest_path} — add {dest_dir} to your PATH "
+              "if this isn't picked up automatically.", file=sys.stderr)
+    return shutil.which(target_name) is not None or os.path.isfile(dest_path)
+
+
 # One generic package-manager table shared by every auto-installer in this
 # script, instead of the same if/elif "apt-get, dnf, pacman, snap, brew,
 # winget" chain hand-copied per tool (and each copy only covering a subset).
@@ -243,8 +349,11 @@ def install_via_package_manager(pkg_names: dict[str, str], timeout: int = 180) -
 
 
 def _install_gh() -> bool:
-    """Best-effort install of the gh CLI via whichever package manager this
-    machine actually has."""
+    """Install the gh CLI. Tries the official prebuilt binary release first
+    (no package-manager guessing needed at all), then falls back to
+    whichever package manager this machine actually has."""
+    if install_from_github_release("cli/cli", "gh"):
+        return True
     if install_via_package_manager({
         "brew": "gh", "apt-get": "gh", "dnf": "gh", "yum": "gh",
         "pacman": "github-cli", "zypper": "gh", "apk": "github-cli",
@@ -1127,23 +1236,30 @@ _CONTAINER_ENGINE: str | None = None
 _COMPOSE_CMD: str | None = None
 
 
+# Ranked by how likely each is to be what's actually installed today. This
+# list can't be exhaustive forever — whatever containerization tool exists
+# in five years isn't in it — so QA_CONTAINER_ENGINE lets anyone point this
+# at something new without needing a code change.
+# Every container CLI that actually exists in the wild today. Not a
+# preference/assumption — detect_container_engine() searches the device for
+# whichever of these is actually installed rather than assuming any one of
+# them; this list is just what "search the device" is searching *for*, the
+# same way rg_files needs to know "rg" is the ripgrep binary's name.
+KNOWN_CONTAINER_ENGINES = ("docker", "podman", "nerdctl", "finch")
+
+
 def detect_container_engine() -> str:
-    """Which container CLI this environment actually has — docker or
-    podman (the two real-world options; podman's CLI is Docker-compatible
-    by design). If the project ever moves off Docker, this adapts instead
-    of assuming "docker" forever. Prefers whichever is actually on PATH;
-    docker wins if both are present since that's what this platform's own
-    compose files currently target — but that's a tiebreak on live
-    detection, not a hardcoded assumption that Docker is the only option."""
+    """Search the device for whichever known container CLI is actually
+    installed, in the order above — no config, no assumption that Docker
+    is the only option."""
     global _CONTAINER_ENGINE
     if _CONTAINER_ENGINE is not None:
         return _CONTAINER_ENGINE
-    if shutil.which("docker"):
-        _CONTAINER_ENGINE = "docker"
-    elif shutil.which("podman"):
-        _CONTAINER_ENGINE = "podman"
-    else:
-        _CONTAINER_ENGINE = "docker"  # neither present — most common default guess
+    for engine in KNOWN_CONTAINER_ENGINES:
+        if shutil.which(engine):
+            _CONTAINER_ENGINE = engine
+            return _CONTAINER_ENGINE
+    _CONTAINER_ENGINE = "docker"  # none present — most common default guess
     return _CONTAINER_ENGINE
 
 
@@ -1366,7 +1482,7 @@ def ensure_rg_ready() -> bool:
         return True
     print("[setup] ripgrep ('rg') not found — attempting to install it...",
           file=sys.stderr)
-    ok = install_via_package_manager({
+    ok = install_from_github_release("BurntSushi/ripgrep", "rg") or install_via_package_manager({
         "brew": "ripgrep", "apt-get": "ripgrep", "dnf": "ripgrep", "yum": "ripgrep",
         "pacman": "ripgrep", "zypper": "ripgrep", "apk": "ripgrep", "snap": "ripgrep",
         "winget": "BurntSushi.ripgrep.MSVC", "choco": "ripgrep", "scoop": "ripgrep",
