@@ -49,6 +49,7 @@ and auto-installs it via the platform's package manager if missing, then
 runs `gh auth login` if not authenticated. Stdlib only otherwise.
 """
 import argparse
+import itertools
 import json
 import os
 import platform
@@ -56,9 +57,106 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from collections import defaultdict
 
 ORG = "Team-Deepiri"
+
+
+# ---------------------------------------------------------------------------
+# QA ASSIST — terminal UI: blue/teal banner, spinner, interactive menu.
+# Colors degrade gracefully (empty strings) when stdout isn't a real
+# terminal — plain output for CI logs, --json, or piping into a file.
+# ---------------------------------------------------------------------------
+
+_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+
+def _c(code: str) -> str:
+    return code if _COLOR else ""
+
+BLUE = _c("\033[38;2;64;140;255m")
+TEAL = _c("\033[38;2;0;191;179m")
+BOLD = _c("\033[1m")
+DIM = _c("\033[2m")
+RESET = _c("\033[0m")
+
+
+def print_banner() -> None:
+    if not _COLOR:
+        print("QA ASSIST — Team-Deepiri PR QA toolkit", file=sys.stderr)
+        return
+    print(f"""
+{TEAL}  ██████{BLUE}  ▄▄▄       {TEAL}▄▄▄▄    {BLUE}▄▄▄▄▄     {TEAL}▄▄▄        ▄▄▄▄    ▄▄▄▄    ▄▄▄  ▄▄▄▄▄▄▄▄▄▄  ▄▄▄▄▄▄▄▄▄▄▄
+{TEAL}▒██▓  ██▒{BLUE}▒████▄    {TEAL}▓█████▄ {BLUE}▓█████▄   {TEAL}▒████▄     ▓█████▄ ▓█████▄ ▒████▄▐░░░░░░░░░░▌ ░░░░░░░░░░▒░
+{TEAL}▒██▒  ██░{BLUE}▒██  ▀█▄  {TEAL}▒██▒ ▄██{BLUE}▒██▒ ▄██  {TEAL}▒██  ▀█▄   ▒██▒ ▄██▒██▒ ▄██▒██  ▀█▄  ▀▀▀▀██▓▀▀▀▀  ▀▀▀▀██▓▀▀▀▀
+{TEAL}▓██░  ██▒{BLUE}░██▄▄▄▄██ {TEAL}▒██░█▀  {BLUE}▒██░█▀    {TEAL}░██▄▄▄▄██  ▒██░█▀  ▒██░█▀  ░██▄▄▄▄██     ▒██▒        ▒██▒
+{TEAL}▒██▄█▓▒ ▒{BLUE} ▓█   ▓██▒{TEAL}░▓█  ▀█▓{BLUE}░▓█  ▀█▓  {TEAL} ▓█   ▓██▒░▓█  ▀█▓░▓█  ▀█▓ ▓█   ▓██▒    ▒██▒        ▒██▒
+{RESET}{DIM}  QA test planning · review-quality enforcement · Team-Deepiri{RESET}
+""")
+
+
+class Spinner:
+    """Minimal stdlib spinner — no dependency beyond threading/time. Silent
+    when stdout isn't a TTY (CI logs stay clean, no braille noise)."""
+    FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+    def __init__(self, message: str):
+        self.message = message
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def _spin(self) -> None:
+        for frame in itertools.cycle(self.FRAMES):
+            if self._stop.is_set():
+                break
+            sys.stderr.write(f"\r{TEAL}{frame}{RESET} {self.message}{' ' * 10}")
+            sys.stderr.flush()
+            time.sleep(0.08)
+        sys.stderr.write("\r" + " " * (len(self.message) + 12) + "\r")
+        sys.stderr.flush()
+
+    def __enter__(self) -> "Spinner":
+        if _COLOR:
+            self._thread = threading.Thread(target=self._spin, daemon=True)
+            self._thread.start()
+        else:
+            print(f"[...] {self.message}", file=sys.stderr)
+        return self
+
+    def __exit__(self, *exc) -> None:
+        if self._thread:
+            self._stop.set()
+            self._thread.join()
+
+
+def maybe_install_opencode(skip: bool = False) -> None:
+    """Optional: ask once whether to also install opencode (the open-source
+    terminal AI coding agent, https://opencode.ai) alongside gh/dtm. Purely
+    opt-in — only prompts on a real TTY, never in CI or --skip-setup runs."""
+    if skip or not sys.stdin.isatty() or not sys.stdout.isatty():
+        return
+    if shutil.which("opencode"):
+        return
+    try:
+        answer = input(f"{TEAL}?{RESET} Also install {BOLD}opencode{RESET} "
+                       "(open-source AI coding CLI, https://opencode.ai)? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+    if answer not in ("y", "yes"):
+        return
+    with Spinner("Installing opencode..."):
+        if shutil.which("npm"):
+            r = subprocess.run(["npm", "install", "-g", "opencode-ai@latest"],
+                               capture_output=True, text=True)
+        else:
+            r = subprocess.run(["bash", "-c", "curl -fsSL https://opencode.ai/install | bash"],
+                               capture_output=True, text=True)
+    if r.returncode == 0:
+        print(f"{TEAL}✓{RESET} opencode installed.", file=sys.stderr)
+    else:
+        print(f"[warn] opencode install failed: {r.stderr.strip()}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -1330,8 +1428,8 @@ def resolve_pr(repo: str, pr_arg: str | None) -> int:
     raise SystemExit(f"No --pr given and no PR is open for the current branch in {repo}.")
 
 
-def main():
-    ap = argparse.ArgumentParser(description="PR QA Test Planner")
+def build_arg_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(description="QA ASSIST — PR QA Test Planner")
     ap.add_argument("--repo", help="OWNER/REPO (default: current gh repo)")
     ap.add_argument("--pr", type=int, help="PR number (default: current branch's PR)")
     ap.add_argument("--org", default=ORG, help=f"GitHub org (default: {ORG})")
@@ -1344,6 +1442,8 @@ def main():
     ap.add_argument("--out", help="write markdown plan to this file")
     ap.add_argument("--skip-setup", action="store_true",
                     help="skip the automatic gh CLI install/auth check")
+    ap.add_argument("--interactive", action="store_true",
+                    help="launch the QA ASSIST interactive menu")
     ap.add_argument("--review-check", action="store_true",
                     help="check review-submission quality instead of planning")
     ap.add_argument("--sweep", action="store_true",
@@ -1355,43 +1455,44 @@ def main():
     ap.add_argument("--nudge", action="store_true",
                     help="(with --review-check) post a nudge comment if the "
                          "review is incomplete")
-    args = ap.parse_args()
+    return ap
 
-    ensure_gh_ready(skip=args.skip_setup)
 
-    if args.review_check:
-        run_review_check(args)
-        return
-
+def run_plan(args) -> None:
     if not args.repo:
-        r = gh("repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner")
+        with Spinner("Detecting current repo..."):
+            r = gh("repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner")
         if r.returncode != 0:
             raise SystemExit("Could not detect repo; pass --repo OWNER/REPO")
         args.repo = r.stdout.strip()
 
     pr_number = resolve_pr(args.repo, args.pr)
-    pr = gh_json(f"repos/{args.repo}/pulls/{pr_number}")
+    with Spinner(f"Fetching {args.repo}#{pr_number}..."):
+        pr = gh_json(f"repos/{args.repo}/pulls/{pr_number}")
 
-    files: list[dict] = []
-    page = 1
-    while True:
-        batch = gh_json(f"repos/{args.repo}/pulls/{pr_number}/files?per_page=100&page={page}")
-        if not batch:
-            break
-        files.extend(batch)
-        if len(batch) < 100:
-            break
-        page += 1
+        files: list[dict] = []
+        page = 1
+        while True:
+            batch = gh_json(f"repos/{args.repo}/pulls/{pr_number}/files?per_page=100&page={page}")
+            if not batch:
+                break
+            files.extend(batch)
+            if len(batch) < 100:
+                break
+            page += 1
 
-    service_map = build_service_map(args.org)
+    with Spinner("Building service map (dtm / .gitmodules)..."):
+        service_map = build_service_map(args.org)
     plan = analyze(files, service_map)
     plan["pr_url"] = pr.get("html_url")
     plan["repo"] = args.repo
-    plan["referenced_prs"] = find_referenced_prs(args.repo, pr.get("body") or "",
-                                                 pr.get("number", 0))
-    plan["submodule_bump_details"] = resolve_submodule_bumps(files, args.org)
+    with Spinner("Checking cross-PR references and submodule bumps..."):
+        plan["referenced_prs"] = find_referenced_prs(args.repo, pr.get("body") or "",
+                                                     pr.get("number", 0))
+        plan["submodule_bump_details"] = resolve_submodule_bumps(files, args.org)
     if args.deep:
-        plan["deep"] = deep_analyze(args.repo, pr, files, args.workspace)
+        with Spinner("Deep-scanning local checkout..."):
+            plan["deep"] = deep_analyze(args.repo, pr, files, args.workspace)
 
     if args.json:
         print(json.dumps(plan, indent=2))
@@ -1407,10 +1508,89 @@ def main():
 
     if args.comment:
         body = md + "\n\n---\n_Comment generated by `deepiri-suite/scripts/pr-qa-planner.py`._"
-        c = gh("pr", "comment", "--repo", args.repo, str(pr_number), "--body", body)
+        with Spinner("Posting comment..."):
+            c = gh("pr", "comment", "--repo", args.repo, str(pr_number), "--body", body)
         if c.returncode != 0:
             raise SystemExit(f"Failed to post comment: {c.stderr.strip()}")
         print(f"\n[posted] QA plan as comment on {pr.get('html_url')}", file=sys.stderr)
+
+
+def run_interactive(base_args) -> None:
+    """QA ASSIST menu — for anyone who'd rather answer prompts than learn flags."""
+    print_banner()
+    menu = [
+        ("Generate a QA test plan for a PR", "plan"),
+        ("Deep-scan a PR (find exact tests to run)", "deep"),
+        ("Check one PR's review quality", "review"),
+        ("Sweep review-quality compliance across repos", "sweep"),
+        ("Exit", "exit"),
+    ]
+    while True:
+        print(f"\n{BOLD}{BLUE}QA ASSIST{RESET} — what would you like to do?")
+        for i, (label, _) in enumerate(menu, 1):
+            print(f"  {TEAL}{i}{RESET}) {label}")
+        try:
+            choice = input(f"{TEAL}?{RESET} Choice [1-{len(menu)}]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if not choice.isdigit() or not (1 <= int(choice) <= len(menu)):
+            print("Please enter a number from the menu.")
+            continue
+        action = menu[int(choice) - 1][1]
+        if action == "exit":
+            return
+
+        args = argparse.Namespace(**vars(base_args))
+        if action in ("plan", "deep", "review"):
+            args.repo = input(f"{TEAL}?{RESET} Repo (e.g. Team-Deepiri/deepiri-auth-service): ").strip() or None
+            pr_in = input(f"{TEAL}?{RESET} PR number (blank = current branch's PR): ").strip()
+            args.pr = int(pr_in) if pr_in else None
+
+        if action == "plan":
+            args.deep = False
+            run_plan(args)
+        elif action == "deep":
+            args.deep = True
+            run_plan(args)
+        elif action == "review":
+            args.review_check = True
+            args.sweep = False
+            args.all_repos = False
+            nudge_in = input(f"{TEAL}?{RESET} Post a nudge comment if incomplete? [y/N]: ").strip().lower()
+            args.nudge = nudge_in in ("y", "yes")
+            run_review_check(args)
+        elif action == "sweep":
+            args.review_check = True
+            args.sweep = True
+            all_in = input(f"{TEAL}?{RESET} Sweep every repo the QA team reviews? [y/N]: ").strip().lower()
+            args.all_repos = all_in in ("y", "yes")
+            if not args.all_repos:
+                args.repo = input(f"{TEAL}?{RESET} Repo to sweep: ").strip() or None
+            limit_in = input(f"{TEAL}?{RESET} PRs per repo [30]: ").strip()
+            args.limit = int(limit_in) if limit_in else 30
+            run_review_check(args)
+
+
+def main():
+    args = build_arg_parser().parse_args()
+
+    if not args.json:
+        print_banner()
+
+    ensure_gh_ready(skip=args.skip_setup)
+    maybe_install_opencode(skip=args.skip_setup)
+
+    no_action = not args.repo and not args.pr and not args.review_check
+    if args.interactive or (no_action and sys.stdin.isatty() and sys.stdout.isatty()):
+        run_interactive(args)
+        return
+
+    if args.review_check:
+        run_review_check(args)
+        return
+
+    run_plan(args)
 
 
 if __name__ == "__main__":
