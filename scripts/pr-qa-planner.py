@@ -432,6 +432,21 @@ def guess_test_command_via_language(repo: str) -> str:
     return "manual"
 
 
+def guess_test_command_from_changed_paths(paths: list[str]) -> str:
+    """Guess a test command from the PR's own changed-file extensions —
+    more accurate than a repo-wide GitHub `language` field, which reflects
+    total bytes across the whole repo (misleading for a mixed-language repo
+    where this specific PR only touches one side of it)."""
+    exts = {os.path.splitext(p)[1].lower() for p in paths}
+    if exts & {".ts", ".tsx", ".js", ".jsx"}:
+        return "npm test"
+    if ".py" in exts:
+        return "pytest"
+    if ".go" in exts:
+        return "go test ./..."
+    return "manual"
+
+
 def build_service_map_from_gitmodules(org: str) -> list[tuple[str, str, str]]:
     """Fallback when dtm isn't available/installable: parse .gitmodules for
     path->repo, then guess the test command from the repo's GitHub language.
@@ -649,7 +664,7 @@ def find_related_prs(repo: str, head_ref: str, exclude_number: int = 0) -> list[
 
 
 def analyze(files: list[dict], service_map: list[tuple[str, str, str]],
-            changed_files_before: int = 0) -> dict:
+            repo: str | None = None, changed_files_before: int = 0) -> dict:
     """Build the plan model from the PR's changed files."""
     areas: dict[str, dict] = defaultdict(
         lambda: {"files": [], "additions": 0, "deletions": 0}
@@ -662,8 +677,25 @@ def analyze(files: list[dict], service_map: list[tuple[str, str, str]],
         any(t in p for t in REBUILD_TRIGGERS) for p in low_paths
     ) or bool(submodule_bumps)
 
+    # When the PR's own repo isn't the platform monorepo, its paths are
+    # repo-relative (e.g. "src/App.tsx", not "deepiri-web-frontend/src/App.tsx")
+    # and will never match service_map's monorepo prefixes. Rather than
+    # dumping everything into "(unknown / other)", fall back to the whole
+    # repo as its own area — same live language lookup used elsewhere, no
+    # hardcoded per-repo list.
+    whole_repo_label, whole_repo_cmd = None, None
+    if repo:
+        short = repo.split("/")[-1]
+        if short != "deepiri-platform" and not any(
+                low.startswith(prefix.lower()) for prefix, _, _ in service_map
+                for low in low_paths):
+            whole_repo_label = prettify_service_name(short)
+            whole_repo_cmd = guess_test_command_from_changed_paths(all_paths)
+
     for f in files:
         label, cmd = classify_path(f["filename"], service_map)
+        if not label and whole_repo_label:
+            label, cmd = whole_repo_label, whole_repo_cmd
         area = areas[label] if label else areas["(unknown / other)"]
         area["files"].append(f["filename"])
         area["additions"] += f.get("additions", 0)
@@ -900,18 +932,34 @@ def render_markdown(plan: dict, pr: dict, repo: str) -> str:
 PY_SYMBOL = re.compile(
     r"^(?:async\s+def|def)\s+(\w+)"
     r"|^class\s+(\w+)"
-    r"|@\w+\.(?:get|post|put|delete|patch)\([\"']([^\"']*)",
+    r"|@\w+\.(?:get|post|put|delete|patch)\(\s*[\"']([^\"']*)",
     re.MULTILINE,
 )
+# Order matters: the more specific function/class alternatives must come
+# before the bare "export default <name>" fallback, or `export default
+# function Home()` gets misread as a symbol literally named "function" (the
+# generic alt's \w+ greedily grabs the "function" keyword itself).
 TS_SYMBOL = re.compile(
-    r"^(?:export\s+)?(?:async\s+)?function\s+(\w+)"
+    r"^(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+(\w+)"
+    r"|^(?:export\s+)?(?:default\s+)?class\s+(\w+)"
     r"|^(?:export\s+)?const\s+(\w+)\s*="
-    r"|^export\s+default\s+(\w+)"
-    r"|\.(?:get|post|put|delete|patch)\([\"']([^\"']*)"
-    r"|^(?:export\s+)?class\s+(\w+)",
+    r"|^export\s+default\s+(\w+)\b"
+    r"|\.(?:get|post|put|delete|patch)\(\s*[\"']([^\"']*)",
     re.MULTILINE,
 )
 IMPORT_RE = re.compile(r"(?:from\s+|require\(|import\s*\(?)[\"']([^\"']+)[\"']")
+
+# Route decorators/calls with method captured separately from the symbol
+# regexes above — needed to generate a real curl command per route instead
+# of just listing "a route changed".
+PY_ROUTE = re.compile(r"@\w+\.(get|post|put|delete|patch)\(\s*[\"']([^\"']*)",
+                     re.MULTILINE | re.IGNORECASE)
+TS_ROUTE = re.compile(r"\.(get|post|put|delete|patch)\(\s*[\"']([^\"']*)",
+                     re.MULTILINE | re.IGNORECASE)
+
+# A file counts as "frontend" for visual-observation purposes by its own
+# extension/path shape, not by which repo it's in.
+FRONTEND_PATH_HINTS = (".tsx", ".jsx", "/components/", "/pages/", "/views/", "/screens/")
 
 
 # Symbols too generic to be worth a reverse-reference hop (they'd match half
@@ -932,6 +980,81 @@ def extract_symbols(content: str, path: str) -> list[str]:
 
 def extract_imports(content: str) -> list[str]:
     return IMPORT_RE.findall(content)
+
+
+def extract_routes(content: str, path: str) -> list[tuple[str, str]]:
+    """(method, route_path) pairs actually defined in this file — real data
+    from the diff, not a guess — so a curl command can be generated per one."""
+    regex = PY_ROUTE if path.endswith(".py") else TS_ROUTE
+    return sorted(set((m.upper(), p) for m, p in regex.findall(content)))
+
+
+def is_frontend_path(path: str) -> bool:
+    low = path.lower()
+    return any(hint in low for hint in FRONTEND_PATH_HINTS)
+
+
+def find_service_port(compose_root: str, short_repo: str) -> str | None:
+    """Read the actual host port for a service straight out of the platform's
+    own docker-compose files — no hardcoded port table. Matches on
+    `container_name`, which this platform's compose files consistently set
+    to `<repo-short-name>-dev` for every app service."""
+    for fname in ("docker-compose.dev.yml", "docker-compose.yml"):
+        compose_path = os.path.join(compose_root, fname)
+        if not os.path.isfile(compose_path):
+            continue
+        try:
+            with open(compose_path) as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        m = (re.search(rf"container_name:\s*{re.escape(short_repo)}-dev\b", text)
+             or re.search(rf"container_name:\s*{re.escape(short_repo)}\b", text))
+        if not m:
+            continue
+        rest = text[m.end():]
+        next_service = re.search(r"\n {2}\S[^\n]*:\n", rest)
+        block = rest[:next_service.start()] if next_service else rest
+        port_m = re.search(r'-\s*"?(\d+):(\d+)"?', block)
+        if port_m:
+            return port_m.group(1)
+    return None
+
+
+def find_frontend_dev_port(repo_path: str) -> str | None:
+    """Read the actual dev-server port straight out of the repo's own
+    package.json/vite config — no hardcoded default like 3000."""
+    pkg = os.path.join(repo_path, "package.json")
+    if os.path.isfile(pkg):
+        try:
+            with open(pkg) as fh:
+                data = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            data = {}
+        dev_script = (data.get("scripts", {}) or {}).get("dev", "")
+        m = re.search(r"--port[= ](\d+)", dev_script)
+        if m:
+            return m.group(1)
+    for cfg_name in ("vite.config.ts", "vite.config.js"):
+        cfg = os.path.join(repo_path, cfg_name)
+        if os.path.isfile(cfg):
+            try:
+                with open(cfg) as fh:
+                    text = fh.read()
+            except OSError:
+                continue
+            m = re.search(r"port:\s*(\d+)", text)
+            if m:
+                return m.group(1)
+    return None
+
+
+def route_to_curl(method: str, route_path: str, port: str | None) -> str:
+    """A real, runnable curl command for one actually-changed route."""
+    host = f"http://localhost:{port}" if port else "http://localhost:<PORT — not found in docker-compose, check the service's port mapping>"
+    if method in ("POST", "PUT", "PATCH"):
+        return f'curl -X {method} {host}{route_path} -H "Content-Type: application/json" -d \'{{}}\''
+    return f"curl -X {method} {host}{route_path}"
 
 
 def repo_root_hint(repo: str) -> str | None:
@@ -1070,6 +1193,13 @@ def deep_analyze(repo: str, pr: dict, files: list[dict], workspace: str | None) 
 
     cd_path = os.path.relpath(root, os.getcwd()) or "."
     js_runner = detect_js_test_runner(root)
+    # Backend service port: read live from the platform's own docker-compose,
+    # if a local platform checkout is available (no hardcoded port table).
+    compose_root = repo_root_hint(f"{repo.split('/')[0]}/deepiri-platform")
+    backend_port = find_service_port(compose_root, short) if compose_root else None
+    # Frontend dev-server port: read live from this repo's own package.json/
+    # vite config — computed lazily, only if a frontend file actually changed.
+    frontend_port = None
     changed = []
     for f in files:
         path = f["filename"]
@@ -1080,6 +1210,22 @@ def deep_analyze(repo: str, pr: dict, files: list[dict], workspace: str | None) 
             continue
         syms = extract_symbols(content, path)
         imports = extract_imports(content)
+        routes = extract_routes(content, path)
+        route_commands = [(m, p, route_to_curl(m, p, backend_port)) for m, p in routes]
+
+        visual_checks = []
+        if is_frontend_path(path):
+            if frontend_port is None:
+                frontend_port = find_frontend_dev_port(root) or ""
+            named_syms = [s for s in syms if s not in GENERIC_SYMBOLS]
+            if named_syms:
+                dev_url = (f"http://localhost:{frontend_port}" if frontend_port
+                          else "the dev server (port not found in package.json/vite.config — check how this repo's frontend starts)")
+                for s in named_syms:
+                    visual_checks.append(
+                        f"Open {dev_url} and visually verify `{s}` (changed in `{path}`) — "
+                        "check it renders, layout/spacing look right, no console errors."
+                    )
         # one import hop: what do the changed files themselves touch?
         neighbors = []
         for imp in imports:
@@ -1107,6 +1253,8 @@ def deep_analyze(repo: str, pr: dict, files: list[dict], workspace: str | None) 
             "users": users,
             "tests": test_files,
             "test_commands": [test_command_for(cd_path, t, js_runner) for t in test_files],
+            "routes": route_commands,
+            "visual_checks": visual_checks,
         })
 
     return {"available": True, "repo_path": root, "head_sha": head_sha,
@@ -1127,16 +1275,25 @@ def render_deep(deep: dict) -> list[str]:
     lines.append("")
     any_hits = False
     for cf in deep.get("files", []):
-        if not (cf["symbols"] or cf["neighbors"] or cf["users"] or cf["tests"]):
+        if not (cf["symbols"] or cf["neighbors"] or cf["users"] or cf["tests"]
+                or cf.get("routes") or cf.get("visual_checks")):
             continue
         any_hits = True
         lines.append(f"- **`{cf['path']}`**")
         if cf["symbols"]:
             lines.append(f"  - Changed symbols/routes: `{', '.join(cf['symbols'])}`")
+        if cf.get("routes"):
+            lines.append("  - **Dynamic test commands — hit the changed route(s):**")
+            for method, route_path, curl_cmd in cf["routes"]:
+                lines.append(f"    - `{method} {route_path}`: `{curl_cmd}`")
         if cf["tests"]:
             lines.append("  - **Tests that exercise it — run these:**")
             for t, c in zip(cf["tests"], cf["test_commands"]):
                 lines.append(f"    - `{t}`: `{c}`")
+        if cf.get("visual_checks"):
+            lines.append("  - **Visual observations to check:**")
+            for vc in cf["visual_checks"]:
+                lines.append(f"    - {vc}")
         if cf["users"]:
             lines.append(f"  - Code that references it (smoke these): `{', '.join(cf['users'])}`")
         if cf["neighbors"]:
@@ -1618,7 +1775,7 @@ def run_plan(args) -> None:
 
     with Spinner("Building service map (dtm / .gitmodules)..."):
         service_map = build_service_map(args.org)
-    plan = analyze(files, service_map)
+    plan = analyze(files, service_map, repo=args.repo)
     plan["pr_url"] = pr.get("html_url")
     plan["repo"] = args.repo
     with Spinner("Checking cross-PR references and submodule bumps..."):
