@@ -86,14 +86,21 @@ def print_banner() -> None:
     if not _COLOR:
         print("QA ASSIST — Team-Deepiri PR QA toolkit", file=sys.stderr)
         return
-    print(f"""
-{TEAL}  ██████{BLUE}  ▄▄▄       {TEAL}▄▄▄▄    {BLUE}▄▄▄▄▄     {TEAL}▄▄▄        ▄▄▄▄    ▄▄▄▄    ▄▄▄  ▄▄▄▄▄▄▄▄▄▄  ▄▄▄▄▄▄▄▄▄▄▄
-{TEAL}▒██▓  ██▒{BLUE}▒████▄    {TEAL}▓█████▄ {BLUE}▓█████▄   {TEAL}▒████▄     ▓█████▄ ▓█████▄ ▒████▄▐░░░░░░░░░░▌ ░░░░░░░░░░▒░
-{TEAL}▒██▒  ██░{BLUE}▒██  ▀█▄  {TEAL}▒██▒ ▄██{BLUE}▒██▒ ▄██  {TEAL}▒██  ▀█▄   ▒██▒ ▄██▒██▒ ▄██▒██  ▀█▄  ▀▀▀▀██▓▀▀▀▀  ▀▀▀▀██▓▀▀▀▀
-{TEAL}▓██░  ██▒{BLUE}░██▄▄▄▄██ {TEAL}▒██░█▀  {BLUE}▒██░█▀    {TEAL}░██▄▄▄▄██  ▒██░█▀  ▒██░█▀  ░██▄▄▄▄██     ▒██▒        ▒██▒
-{TEAL}▒██▄█▓▒ ▒{BLUE} ▓█   ▓██▒{TEAL}░▓█  ▀█▓{BLUE}░▓█  ▀█▓  {TEAL} ▓█   ▓██▒░▓█  ▀█▓░▓█  ▀█▓ ▓█   ▓██▒    ▒██▒        ▒██▒
-{RESET}{DIM}  QA test planning · review-quality enforcement · Team-Deepiri{RESET}
-""")
+    title = "Q A   A S S I S T"
+    subtitle = "Team-Deepiri  ·  PR QA Toolkit"
+    width = max(len(title), len(subtitle)) + 6
+
+    def centered(s: str) -> str:
+        return s.center(width)
+
+    top = "╭" + "─" * width + "╮"
+    mid = "├" + "─" * width + "┤"
+    bot = "╰" + "─" * width + "╯"
+    print(f"{BLUE}{top}{RESET}")
+    print(f"{BLUE}│{RESET}{TEAL}{BOLD}{centered(title)}{RESET}{BLUE}│{RESET}")
+    print(f"{BLUE}{mid}{RESET}")
+    print(f"{BLUE}│{RESET}{DIM}{centered(subtitle)}{RESET}{BLUE}│{RESET}")
+    print(f"{BLUE}{bot}{RESET}")
 
 
 class Spinner:
@@ -1416,6 +1423,131 @@ def run_review_check(args) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Interactive report viewer — the terminal experience for the plan, instead
+# of just dumping markdown. Parses render_markdown()'s own output (single
+# source of truth, no duplicated formatting logic) into scroll/checkbox
+# lines. Falls back to a flat print if curses isn't available or stdout
+# isn't a real terminal (CI, piping, redirected output).
+# ---------------------------------------------------------------------------
+
+CHECKBOX_LINE_RE = re.compile(r"^(\s*-\s*)\[([ xX])\](.*)$")
+
+
+def _parse_report_lines(md: str) -> list[dict]:
+    lines = []
+    for raw in md.split("\n"):
+        m = CHECKBOX_LINE_RE.match(raw)
+        if m:
+            prefix, mark, rest = m.groups()
+            lines.append({"kind": "checkbox", "checked": mark.lower() == "x",
+                         "prefix": prefix, "rest": rest, "raw": raw})
+        elif raw.startswith("#"):
+            lines.append({"kind": "header", "raw": raw})
+        else:
+            lines.append({"kind": "text", "raw": raw})
+    return lines
+
+
+def _render_report_line(line: dict) -> str:
+    if line["kind"] == "checkbox":
+        mark = "x" if line["checked"] else " "
+        return f"{line['prefix']}[{mark}]{line['rest']}"
+    return line["raw"]
+
+
+def run_interactive_report(md: str, export_path: str) -> bool:
+    """Curses checklist viewer over the generated plan. Returns True if it
+    ran (caller shouldn't also flat-print); False if curses isn't usable
+    here and the caller should fall back to a plain print."""
+    try:
+        import curses
+    except ImportError:
+        return False
+
+    lines = _parse_report_lines(md)
+    checkbox_idx = [i for i, l in enumerate(lines) if l["kind"] == "checkbox"]
+
+    def loop(stdscr):
+        curses.curs_set(0)
+        curses.start_color()
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_CYAN, -1)
+        curses.init_pair(2, curses.COLOR_BLUE, -1)
+        curses.init_pair(3, curses.COLOR_GREEN, -1)
+        teal_attr = curses.color_pair(1) | curses.A_BOLD
+        header_attr = curses.color_pair(2) | curses.A_BOLD
+        checked_attr = curses.color_pair(3)
+
+        top = 0
+        cursor = 0 if checkbox_idx else -1
+        status = ""
+
+        while True:
+            stdscr.erase()
+            h, w = stdscr.getmaxyx()
+            body_h = max(1, h - 2)
+            cur_line = checkbox_idx[cursor] if cursor >= 0 else -1
+            if cur_line >= 0:
+                if cur_line < top:
+                    top = cur_line
+                elif cur_line >= top + body_h:
+                    top = cur_line - body_h + 1
+
+            for row in range(body_h):
+                li = top + row
+                if li >= len(lines):
+                    break
+                line = lines[li]
+                text = _render_report_line(line)
+                attr = curses.A_NORMAL
+                if line["kind"] == "header":
+                    attr = header_attr
+                elif line["kind"] == "checkbox":
+                    attr = checked_attr if line["checked"] else curses.A_NORMAL
+                    if li == cur_line:
+                        attr |= curses.A_REVERSE
+                try:
+                    stdscr.addnstr(row, 0, text, max(0, w - 1), attr)
+                except curses.error:
+                    pass
+
+            footer = (" ↑/↓ or j/k move   space toggle   e export   q quit"
+                     f"   {status}")
+            try:
+                stdscr.addnstr(h - 1, 0, footer[:w - 1], max(0, w - 1), teal_attr)
+            except curses.error:
+                pass
+            stdscr.refresh()
+
+            key = stdscr.getch()
+            if key in (ord("q"), 27):
+                return
+            if key in (ord("j"), curses.KEY_DOWN):
+                if checkbox_idx:
+                    cursor = min(cursor + 1, len(checkbox_idx) - 1)
+                else:
+                    top = min(top + 1, max(0, len(lines) - body_h))
+            elif key in (ord("k"), curses.KEY_UP):
+                if checkbox_idx:
+                    cursor = max(cursor - 1, 0)
+                else:
+                    top = max(top - 1, 0)
+            elif key in (ord(" "), 10, 13, curses.KEY_ENTER):
+                if cur_line >= 0:
+                    lines[cur_line]["checked"] = not lines[cur_line]["checked"]
+            elif key == ord("e"):
+                try:
+                    with open(export_path, "w") as f:
+                        f.write("\n".join(_render_report_line(l) for l in lines) + "\n")
+                    status = f"[saved {export_path}]"
+                except OSError as e:
+                    status = f"[save failed: {e}]"
+
+    curses.wrapper(loop)
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -1444,6 +1576,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     help="skip the automatic gh CLI install/auth check")
     ap.add_argument("--interactive", action="store_true",
                     help="launch the QA ASSIST interactive menu")
+    ap.add_argument("--plain", action="store_true",
+                    help="print flat markdown instead of the interactive "
+                         "checklist viewer (for logs/piping/tmux capture)")
     ap.add_argument("--review-check", action="store_true",
                     help="check review-submission quality instead of planning")
     ap.add_argument("--sweep", action="store_true",
@@ -1499,12 +1634,18 @@ def run_plan(args) -> None:
         return
 
     md = render_markdown(plan, pr, args.repo)
-    print(md)
 
     if args.out:
         with open(args.out, "w") as f:
             f.write(md + "\n")
-        print(f"\n[written] {args.out}", file=sys.stderr)
+        print(f"[written] {args.out}", file=sys.stderr)
+
+    shown_interactively = False
+    if not args.plain and sys.stdout.isatty():
+        default_export = args.out or f"qa-plan-{args.repo.split('/')[-1]}-{pr_number}.md"
+        shown_interactively = run_interactive_report(md, default_export)
+    if not shown_interactively:
+        print(md)
 
     if args.comment:
         body = md + "\n\n---\n_Comment generated by `deepiri-suite/scripts/pr-qa-planner.py`._"
