@@ -49,6 +49,8 @@ and auto-installs it via the platform's package manager if missing, then
 runs `gh auth login` if not authenticated. Stdlib only otherwise.
 """
 import argparse
+import glob
+import http
 import itertools
 import json
 import os
@@ -379,8 +381,13 @@ def build_service_map_from_dtm(platform_root: str) -> list[tuple[str, str, str]]
     of the local platform checkout. Returns None if dtm isn't usable here."""
     if not ensure_dtm_ready():
         return None
-    r = subprocess.run(["dtm", "scan", "--path", platform_root],
-                       capture_output=True, text=True, timeout=120)
+    try:
+        r = subprocess.run(["dtm", "scan", "--path", platform_root],
+                           capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        print("[warn] dtm scan timed out after 120s — falling back to .gitmodules",
+              file=sys.stderr)
+        return None
     if r.returncode != 0:
         print(f"[warn] dtm scan failed: {r.stderr.strip()}", file=sys.stderr)
         return None
@@ -406,11 +413,10 @@ def build_service_map_from_dtm(platform_root: str) -> list[tuple[str, str, str]]
     return entries or None
 
 
-def fetch_gitmodules_text(org: str) -> str | None:
-    """Fetch deepiri-platform's .gitmodules via the GitHub API — works with
-    no local checkout, still a live read instead of a hardcoded list."""
-    r = gh("api", f"repos/{org}/deepiri-platform/contents/.gitmodules",
-           "--jq", ".content")
+def fetch_gitmodules_text(repo: str) -> str | None:
+    """Fetch a repo's own .gitmodules via the GitHub API — works with no
+    local checkout, still a live read instead of a hardcoded list."""
+    r = gh("api", f"repos/{repo}/contents/.gitmodules", "--jq", ".content")
     if r.returncode != 0 or not r.stdout.strip():
         return None
     import base64
@@ -447,11 +453,15 @@ def guess_test_command_from_changed_paths(paths: list[str]) -> str:
     return "manual"
 
 
-def build_service_map_from_gitmodules(org: str) -> list[tuple[str, str, str]]:
-    """Fallback when dtm isn't available/installable: parse .gitmodules for
-    path->repo, then guess the test command from the repo's GitHub language.
-    Still fully dynamic — no per-repo list to maintain by hand."""
-    text = fetch_gitmodules_text(org)
+def build_service_map_from_gitmodules(repo: str) -> list[tuple[str, str, str]]:
+    """Fallback when dtm isn't available/installable: parse the analyzed
+    repo's own .gitmodules for path->repo, then guess the test command from
+    each submodule's GitHub language. Still fully dynamic — no per-repo
+    list to maintain by hand, and no assumption about which repo in the org
+    is "the monorepo": whichever repo is being analyzed either has its own
+    .gitmodules (and this returns real entries) or it doesn't (empty list,
+    and analyze() treats it as a standalone repo)."""
+    text = fetch_gitmodules_text(repo)
     if not text:
         return []
     entries = []
@@ -465,21 +475,29 @@ def build_service_map_from_gitmodules(org: str) -> list[tuple[str, str, str]]:
         label = prettify_service_name(short)
         if path.startswith("platform-services/shared/"):
             label += " (shared)"
-        cmd = guess_test_command_via_language(f"{org}/{short}")
+        # Submodules live in the same org as their parent monorepo — no need
+        # to parse the org out of the .gitmodules URL (SSH-style
+        # git@host:org/repo.git doesn't split cleanly on "/" anyway).
+        cmd = guess_test_command_via_language(f"{repo.split('/')[0]}/{short}")
         entries.append((path, label, f"cd {path} && {cmd}"))
     return entries
 
 
-def build_service_map(org: str) -> list[tuple[str, str, str]]:
+def build_service_map(repo: str, org: str) -> list[tuple[str, str, str]]:
     """The live path->(area, test command) map used by classify_path, built
-    fresh each run instead of hand-maintained. Tries dtm first (precise),
-    falls back to .gitmodules + language guess (works anywhere)."""
-    platform_root = repo_root_hint(f"{org}/deepiri-platform")
-    if platform_root:
-        from_dtm = build_service_map_from_dtm(platform_root)
+    fresh each run from the repo actually being analyzed — not a fixed
+    "the monorepo is always named X" assumption. Tries a local dtm scan of
+    that repo first (precise), falls back to that repo's own .gitmodules
+    (works anywhere, no local checkout needed). Both naturally return an
+    empty list for a repo with no submodule structure of its own — analyze()
+    treats that as "this PR's whole repo is its own area" rather than trying
+    to force a path-prefix match that can't exist."""
+    local_root = repo_root_hint(repo)
+    if local_root:
+        from_dtm = build_service_map_from_dtm(local_root)
         if from_dtm:
             return from_dtm
-    return build_service_map_from_gitmodules(org)
+    return build_service_map_from_gitmodules(repo)
 
 # Risk-signal keyword -> (flag, QA guidance)
 RISK_RULES = [
@@ -565,6 +583,7 @@ def is_gitlink_change(f: dict) -> bool:
 
 
 SUBPROJECT_SHA_RE = re.compile(r"^\+Subproject commit ([0-9a-f]{40})", re.MULTILINE)
+OLD_SUBPROJECT_SHA_RE = re.compile(r"^-Subproject commit ([0-9a-f]{40})", re.MULTILINE)
 
 # Cross-repo refs like "Team-Deepiri/deepiri-web-frontend#123" — unambiguous,
 # no keyword needed.
@@ -677,20 +696,19 @@ def analyze(files: list[dict], service_map: list[tuple[str, str, str]],
         any(t in p for t in REBUILD_TRIGGERS) for p in low_paths
     ) or bool(submodule_bumps)
 
-    # When the PR's own repo isn't the platform monorepo, its paths are
-    # repo-relative (e.g. "src/App.tsx", not "deepiri-web-frontend/src/App.tsx")
-    # and will never match service_map's monorepo prefixes. Rather than
-    # dumping everything into "(unknown / other)", fall back to the whole
-    # repo as its own area — same live language lookup used elsewhere, no
-    # hardcoded per-repo list.
+    # service_map is now built from the analyzed repo's OWN submodule
+    # structure (see build_service_map): it's non-empty exactly when this
+    # repo has submodules of its own (a monorepo, whatever it's named), and
+    # empty when it doesn't (a standalone repo, whose paths are repo-
+    # relative like "src/App.tsx" and could never match a path prefix
+    # anyway). So "no service_map at all" — not a hardcoded repo name — is
+    # the correct, fully dynamic signal to treat the whole repo as one area
+    # instead of dumping everything into "(unknown / other)".
     whole_repo_label, whole_repo_cmd = None, None
-    if repo:
+    if repo and not service_map:
         short = repo.split("/")[-1]
-        if short != "deepiri-platform" and not any(
-                low.startswith(prefix.lower()) for prefix, _, _ in service_map
-                for low in low_paths):
-            whole_repo_label = prettify_service_name(short)
-            whole_repo_cmd = guess_test_command_from_changed_paths(all_paths)
+        whole_repo_label = prettify_service_name(short)
+        whole_repo_cmd = guess_test_command_from_changed_paths(all_paths)
 
     for f in files:
         label, cmd = classify_path(f["filename"], service_map)
@@ -929,10 +947,19 @@ def render_markdown(plan: dict, pr: dict, repo: str) -> str:
 #      any test files that exercise it. Depth is bounded to changed files +
 #      one import hop + one rg hop (who references the symbols).
 
+# The HTTP verbs this script knows how to spot in route decorators/calls —
+# sourced from Python's own stdlib http.HTTPMethod enum (the language's
+# canonical definition of what an HTTP method is) rather than typed out by
+# hand, and defined once here instead of copy-pasted into four regexes.
+# CONNECT/TRACE are excluded — no web framework registers routes for them.
+HTTP_METHODS = tuple(m.value.lower() for m in http.HTTPMethod
+                     if m not in (http.HTTPMethod.CONNECT, http.HTTPMethod.TRACE))
+_METHOD_ALT = "|".join(HTTP_METHODS)
+
 PY_SYMBOL = re.compile(
     r"^(?:async\s+def|def)\s+(\w+)"
     r"|^class\s+(\w+)"
-    r"|@\w+\.(?:get|post|put|delete|patch)\(\s*[\"']([^\"']*)",
+    rf"|@\w+\.(?:{_METHOD_ALT})\(\s*[\"']([^\"']*)",
     re.MULTILINE,
 )
 # Order matters: the more specific function/class alternatives must come
@@ -944,7 +971,7 @@ TS_SYMBOL = re.compile(
     r"|^(?:export\s+)?(?:default\s+)?class\s+(\w+)"
     r"|^(?:export\s+)?const\s+(\w+)\s*="
     r"|^export\s+default\s+(\w+)\b"
-    r"|\.(?:get|post|put|delete|patch)\(\s*[\"']([^\"']*)",
+    rf"|\.(?:{_METHOD_ALT})\(\s*[\"']([^\"']*)",
     re.MULTILINE,
 )
 IMPORT_RE = re.compile(r"(?:from\s+|require\(|import\s*\(?)[\"']([^\"']+)[\"']")
@@ -952,9 +979,9 @@ IMPORT_RE = re.compile(r"(?:from\s+|require\(|import\s*\(?)[\"']([^\"']+)[\"']")
 # Route decorators/calls with method captured separately from the symbol
 # regexes above — needed to generate a real curl command per route instead
 # of just listing "a route changed".
-PY_ROUTE = re.compile(r"@\w+\.(get|post|put|delete|patch)\(\s*[\"']([^\"']*)",
+PY_ROUTE = re.compile(rf"@\w+\.({_METHOD_ALT})\(\s*[\"']([^\"']*)",
                      re.MULTILINE | re.IGNORECASE)
-TS_ROUTE = re.compile(r"\.(get|post|put|delete|patch)\(\s*[\"']([^\"']*)",
+TS_ROUTE = re.compile(rf"\.({_METHOD_ALT})\(\s*[\"']([^\"']*)",
                      re.MULTILINE | re.IGNORECASE)
 
 # A file counts as "frontend" for visual-observation purposes by its own
@@ -994,15 +1021,50 @@ def is_frontend_path(path: str) -> bool:
     return any(hint in low for hint in FRONTEND_PATH_HINTS)
 
 
+def find_compose_files(directory: str) -> list[str]:
+    """Docker Compose files in a directory, discovered by Compose's own
+    naming convention (`*compose*.y*ml` — covers docker-compose.yml,
+    docker-compose.dev.yml, compose.yaml, compose.override.yml, etc.)
+    instead of a fixed hardcoded filename list. A "dev" file sorts first
+    since that's the one local QA actually runs against."""
+    matches = [p for p in glob.glob(os.path.join(directory, "*compose*.y*ml"))
+              if os.path.isfile(p)]
+    matches.sort(key=lambda p: (0 if "dev" in os.path.basename(p).lower() else 1,
+                                len(os.path.basename(p))))
+    return matches
+
+
+def find_compose_root() -> str | None:
+    """Find a local checkout with docker-compose files, without assuming
+    which repo it is by name — starts from the current git top-level and
+    walks UP through ancestor directories (this script is commonly run from
+    inside a nested submodule, e.g. deepiri-suite/, whose own git top-level
+    is itself, not the platform monorepo a few levels up)."""
+    try:
+        top = subprocess.run(["git", "rev-parse", "--show-toplevel"],
+                             capture_output=True, text=True, check=True).stdout.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    candidates = [top]
+    parent = os.path.dirname(top)
+    for _ in range(6):
+        if not parent or parent == os.path.dirname(parent):
+            break
+        candidates.append(parent)
+        parent = os.path.dirname(parent)
+    for c in candidates:
+        if find_compose_files(c):
+            return c
+    return None
+
+
 def find_service_info(compose_root: str, short_repo: str) -> dict | None:
     """Read a service's real port, container name, and compose service key
     straight out of the platform's own docker-compose files — no hardcoded
     port/container table. Matches on `container_name`, which this platform's
     compose files consistently set to `<repo-short-name>-dev`."""
-    for fname in ("docker-compose.dev.yml", "docker-compose.yml"):
-        compose_path = os.path.join(compose_root, fname)
-        if not os.path.isfile(compose_path):
-            continue
+    for compose_path in find_compose_files(compose_root):
+        fname = os.path.basename(compose_path)
         try:
             with open(compose_path) as fh:
                 text = fh.read()
@@ -1070,19 +1132,21 @@ def repo_root_hint(repo: str) -> str | None:
 
     Checks, in order:
       1. current directory is inside a git repo whose remote matches `repo`
-      2. DEEPIRI_QA_WORKSPACE env var (QA's checked-out clone root)
-      3. sibling/child dirs named after the repo's short name
+      2. that repo's ancestor directories, in case cwd is itself inside a
+         nested submodule (e.g. running from deepiri-suite/, whose own git
+         top-level is deepiri-suite itself, not the platform monorepo that
+         contains it) — walks up looking for a `.gitmodules` referencing the
+         target, exactly like check 1 but from higher up the tree
+      3. DEEPIRI_QA_WORKSPACE env var (QA's checked-out clone root)
+      4. sibling/child dirs named after the repo's short name
     """
     short = repo.split("/")[-1]
     candidates: list[str] = []
-    try:
-        top = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            capture_output=True, text=True, check=True,
-        ).stdout.strip()
+
+    def add_from_top(top: str) -> None:
         candidates.append(top)
-        # If the current repo is the platform monorepo, the PR's repo may be a
-        # submodule nested deeper — resolve it via .gitmodules (cheap, exact).
+        # If `top` is a monorepo, the target repo may be a submodule nested
+        # inside it — resolve it via .gitmodules (cheap, exact).
         gm = os.path.join(top, ".gitmodules")
         if os.path.isfile(gm):
             r = subprocess.run(
@@ -1096,6 +1160,22 @@ def repo_root_hint(repo: str) -> str | None:
                 parts = line.split()
                 if len(parts) >= 2 and parts[0].endswith(".path"):
                     candidates.append(os.path.join(top, parts[1]))
+
+    try:
+        top = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        add_from_top(top)
+        # Walk up a bounded number of ancestor directories in case `top`
+        # is itself a submodule nested inside a larger monorepo checkout.
+        parent = os.path.dirname(top)
+        for _ in range(6):
+            if not parent or parent == os.path.dirname(parent):
+                break
+            if os.path.isdir(os.path.join(parent, ".git")):
+                add_from_top(parent)
+            parent = os.path.dirname(parent)
     except (subprocess.CalledProcessError, FileNotFoundError):
         pass
     ws = os.environ.get("DEEPIRI_QA_WORKSPACE")
@@ -1167,8 +1247,53 @@ def test_command_for(cd_path: str, rel_path: str, runner: str | None) -> str:
     return f"cd {cd_path} && npx jest {rel_path}"
 
 
+_RG_READY: bool | None = None
+
+
+def ensure_rg_ready() -> bool:
+    """--deep's rg_files() silently returned nothing on a machine without
+    ripgrep — not a crash, just quietly worse results. Auto-install it like
+    gh/dtm so --deep actually works out of the box. Cached per run."""
+    global _RG_READY
+    if _RG_READY is not None:
+        return _RG_READY
+    if shutil.which("rg"):
+        _RG_READY = True
+        return True
+    print("[setup] ripgrep ('rg') not found — attempting to install it...",
+          file=sys.stderr)
+    system = platform.system()
+    ok = False
+    try:
+        if system == "Darwin" and shutil.which("brew"):
+            ok = subprocess.run(["brew", "install", "ripgrep"]).returncode == 0
+        elif system == "Linux":
+            if shutil.which("apt-get"):
+                ok = subprocess.run(["sudo", "apt-get", "install", "-y", "ripgrep"]).returncode == 0
+            elif shutil.which("dnf"):
+                ok = subprocess.run(["sudo", "dnf", "install", "-y", "ripgrep"]).returncode == 0
+            elif shutil.which("pacman"):
+                ok = subprocess.run(["sudo", "pacman", "-S", "--noconfirm", "ripgrep"]).returncode == 0
+            elif shutil.which("snap"):
+                ok = subprocess.run(["sudo", "snap", "install", "ripgrep", "--classic"]).returncode == 0
+        elif system == "Windows" and shutil.which("winget"):
+            ok = subprocess.run(["winget", "install", "--id", "BurntSushi.ripgrep.MSVC"]).returncode == 0
+    except OSError:
+        ok = False
+    if not ok or shutil.which("rg") is None:
+        print("[warn] could not auto-install ripgrep — --deep's cross-reference "
+              "search will find nothing. Install manually: https://github.com/BurntSushi/ripgrep",
+              file=sys.stderr)
+        _RG_READY = False
+        return False
+    _RG_READY = True
+    return True
+
+
 def rg_files(repo_path: str, pattern: str, extra_globs: list[str] | None = None) -> list[str]:
     """Files containing `pattern`, via ripgrep (gitignored dirs auto-skipped)."""
+    if not ensure_rg_ready():
+        return []
     cmd = ["rg", "-l", "--no-messages", "-g", "!node_modules", "-g", "!*.lock",
            "--glob", "*.{py,ts,tsx,js,jsx}", pattern, repo_path]
     if extra_globs:
@@ -1179,6 +1304,78 @@ def rg_files(repo_path: str, pattern: str, extra_globs: list[str] | None = None)
     if r.returncode not in (0, 1):
         return []
     return [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
+
+
+def diff_files_between(repo_path: str, old_rev: str, new_rev: str) -> list[str]:
+    try:
+        r = subprocess.run(["git", "-C", repo_path, "diff", "--name-only", old_rev, new_rev],
+                           capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        return []
+    if r.returncode != 0:
+        return []
+    return [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
+
+
+def _scan_one_file(root: str, rev: str, path: str, cd_path: str, js_runner: str | None,
+                    backend_port: str | None, frontend_port_state: list[str]) -> dict | None:
+    """The per-file deep-scan logic, shared between the PR's own changed
+    files and files changed inside a bumped submodule's diff.
+    `frontend_port_state` is a shared 0/1-item list used as a lazily-filled
+    cache slot for the frontend dev port across repeated calls."""
+    if not path.endswith((".py", ".ts", ".tsx", ".js", ".jsx")):
+        return None
+    content = git_show_file(root, rev, path)
+    if content is None:
+        return None
+    syms = extract_symbols(content, path)
+    imports = extract_imports(content)
+    routes = extract_routes(content, path)
+    route_commands = [(m, p, route_to_curl(m, p, backend_port)) for m, p in routes]
+
+    visual_checks = []
+    if is_frontend_path(path):
+        if not frontend_port_state:
+            frontend_port_state.append(find_frontend_dev_port(root) or "")
+        frontend_port = frontend_port_state[0]
+        named_syms = [s for s in syms if s not in GENERIC_SYMBOLS]
+        if named_syms:
+            dev_url = (f"http://localhost:{frontend_port}" if frontend_port
+                      else "the dev server (port not found in package.json/vite.config - check how this repo's frontend starts)")
+            for s in named_syms:
+                visual_checks.append(
+                    f"Open {dev_url} and visually verify `{s}` (changed in `{path}`) - "
+                    "check it renders, layout/spacing look right, no console errors."
+                )
+    # one import hop: what do the changed files themselves touch?
+    neighbors = []
+    for imp in imports:
+        base = imp.split("/")[-1].removesuffix(".py")
+        if base and base not in (".", ".."):
+            hits = rg_files(root, rf"(from|import|require)\('?[^'\"\n]*{re.escape(base)}['\"]?")
+            neighbors += [h for h in hits if h.split("/")[-1] != path.split("/")[-1]]
+    # reverse hop: who references the changed symbols (tests + consumers)?
+    users = []
+    for s in syms:
+        if s in GENERIC_SYMBOLS:
+            continue
+        users += rg_files(root, rf"\b{re.escape(s)}\b")
+    base = path.split("/")[-1]
+    users = sorted(set(os.path.relpath(u, root) for u in users
+                       if u.split("/")[-1] != base))[:12]
+    neighbors = sorted(set(os.path.relpath(n, root) for n in neighbors))[:8]
+    test_files = sorted(set(u for u in users if any(m in u for m in TEST_MARKERS)))[:6]
+    return {
+        "path": path,
+        "symbols": syms,
+        "imports": imports,
+        "neighbors": neighbors,
+        "users": users,
+        "tests": test_files,
+        "test_commands": [test_command_for(cd_path, t, js_runner) for t in test_files],
+        "routes": route_commands,
+        "visual_checks": visual_checks,
+    }
 
 
 def deep_analyze(repo: str, pr: dict, files: list[dict], workspace: str | None) -> dict:
@@ -1202,9 +1399,11 @@ def deep_analyze(repo: str, pr: dict, files: list[dict], workspace: str | None) 
     cd_path = os.path.relpath(root, os.getcwd()) or "."
     js_runner = detect_js_test_runner(root)
     # Backend service info (port, container, compose service key): read live
-    # from the platform's own docker-compose, if a local platform checkout
-    # is available — no hardcoded port/container table.
-    compose_root = repo_root_hint(f"{repo.split('/')[0]}/deepiri-platform")
+    # from whichever local checkout actually has docker-compose files — the
+    # repo being analyzed itself (if it's the monorepo) or the checkout this
+    # script is being run from/inside (if analyzing one of its submodules
+    # directly). No hardcoded assumption about a specific repo's name.
+    compose_root = root if find_compose_files(root) else find_compose_root()
     service_info = find_service_info(compose_root, short) if compose_root else None
     backend_port = service_info["port"] if service_info else None
     docker_commands = []
@@ -1216,63 +1415,59 @@ def deep_analyze(repo: str, pr: dict, files: list[dict], workspace: str | None) 
         ]
     # Frontend dev-server port: read live from this repo's own package.json/
     # vite config — computed lazily, only if a frontend file actually changed.
-    frontend_port = None
+    frontend_port_state: list[str] = []  # lazily-filled 0/1-item cache slot
     changed = []
     for f in files:
-        path = f["filename"]
-        if not path.endswith((".py", ".ts", ".tsx", ".js", ".jsx")):
-            continue
-        content = git_show_file(root, head_sha, path)
-        if content is None:
-            continue
-        syms = extract_symbols(content, path)
-        imports = extract_imports(content)
-        routes = extract_routes(content, path)
-        route_commands = [(m, p, route_to_curl(m, p, backend_port)) for m, p in routes]
+        entry = _scan_one_file(root, head_sha, f["filename"], cd_path, js_runner,
+                               backend_port, frontend_port_state)
+        if entry:
+            changed.append(entry)
 
-        visual_checks = []
-        if is_frontend_path(path):
-            if frontend_port is None:
-                frontend_port = find_frontend_dev_port(root) or ""
-            named_syms = [s for s in syms if s not in GENERIC_SYMBOLS]
-            if named_syms:
-                dev_url = (f"http://localhost:{frontend_port}" if frontend_port
-                          else "the dev server (port not found in package.json/vite.config — check how this repo's frontend starts)")
-                for s in named_syms:
-                    visual_checks.append(
-                        f"Open {dev_url} and visually verify `{s}` (changed in `{path}`) — "
-                        "check it renders, layout/spacing look right, no console errors."
-                    )
-        # one import hop: what do the changed files themselves touch?
-        neighbors = []
-        for imp in imports:
-            base = imp.split("/")[-1].removesuffix(".py")
-            if base and base not in (".", ".."):
-                hits = rg_files(root, rf"(from|import|require)\('?[^'\"\n]*{re.escape(base)}['\"]?")
-                neighbors += [h for h in hits if h.split("/")[-1] != path.split("/")[-1]]
-        # reverse hop: who references the changed symbols (tests + consumers)?
-        users = []
-        for s in syms:
-            if s in GENERIC_SYMBOLS:
-                continue
-            users += rg_files(root, rf"\b{re.escape(s)}\b")
-        base = path.split("/")[-1]
-        def relpath(u: str) -> str:
-            return os.path.relpath(u, root)
-        users = sorted(set(relpath(u) for u in users if u.split("/")[-1] != base))[:12]
-        neighbors = sorted(set(relpath(n) for n in neighbors))[:8]
-        test_files = sorted(set(u for u in users if any(m in u for m in TEST_MARKERS)))[:6]
-        changed.append({
-            "path": path,
-            "symbols": syms,
-            "imports": imports,
-            "neighbors": neighbors,
-            "users": users,
-            "tests": test_files,
-            "test_commands": [test_command_for(cd_path, t, js_runner) for t in test_files],
-            "routes": route_commands,
-            "visual_checks": visual_checks,
-        })
+    # Submodule bumps show up here as a one-line gitlink pointer change, not
+    # real file diffs — the code that actually changed lives inside the
+    # bumped submodule's own commit range. If that submodule is checked out
+    # locally, scan ITS diff the same way, so a platform PR that's mostly
+    # submodule bumps still surfaces real curl/test/visual commands instead
+    # of "nothing to scan".
+    for f in files:
+        if not is_gitlink_change(f):
+            continue
+        sub_path = f["filename"].rstrip("/")
+        sub_short = sub_path.split("/")[-1]
+        patch = f.get("patch") or ""
+        new_m = SUBPROJECT_SHA_RE.search(patch)
+        old_m = OLD_SUBPROJECT_SHA_RE.search(patch)
+        if not new_m or not old_m:
+            continue
+        new_sha, old_sha = new_m.group(1), old_m.group(1)
+        sub_root = repo_root_hint(f"{repo.split('/')[0]}/{sub_short}")
+        if not sub_root:
+            continue
+        if git_rev(sub_root, new_sha) is None:
+            subprocess.run(["git", "-C", sub_root, "fetch", "origin"],
+                           capture_output=True, text=True, timeout=30)
+        if git_rev(sub_root, new_sha) is None or git_rev(sub_root, old_sha) is None:
+            continue  # can't diff without both revisions present locally
+        sub_changed_paths = diff_files_between(sub_root, old_sha, new_sha)
+        if not sub_changed_paths:
+            continue
+
+        sub_cd_path = os.path.relpath(sub_root, os.getcwd()) or "."
+        sub_js_runner = detect_js_test_runner(sub_root)
+        sub_service_info = find_service_info(compose_root, sub_short) if compose_root else None
+        sub_backend_port = sub_service_info["port"] if sub_service_info else None
+        if sub_service_info:
+            for cmd_ in (f"docker logs -f {sub_service_info['container_name']}",
+                        f"docker exec -it {sub_service_info['container_name']} sh",
+                        f"docker compose -f {sub_service_info['compose_file']} restart {sub_service_info['service_key']}"):
+                if cmd_ not in docker_commands:
+                    docker_commands.append(cmd_)
+        for sp in sub_changed_paths:
+            entry = _scan_one_file(sub_root, new_sha, sp, sub_cd_path, sub_js_runner,
+                                   sub_backend_port, frontend_port_state)
+            if entry:
+                entry["path"] = f"{sub_path}/{sp}"
+                changed.append(entry)
 
     return {"available": True, "repo_path": root, "head_sha": head_sha,
             "files": changed, "docker_commands": docker_commands}
@@ -1650,8 +1845,12 @@ def copy_to_clipboard(text: str) -> bool:
         if not shutil.which(cmd[0]):
             continue
         try:
-            r = subprocess.run(cmd, input=text, text=True, capture_output=True)
-        except OSError:
+            # xclip/xsel hang indefinitely if there's no working X display
+            # (headless/SSH session, $DISPLAY unset) — a hard timeout keeps
+            # a bad clipboard tool from freezing the whole interactive UI.
+            r = subprocess.run(cmd, input=text, text=True, capture_output=True,
+                               timeout=3)
+        except (OSError, subprocess.TimeoutExpired):
             continue
         if r.returncode == 0:
             return True
@@ -1903,7 +2102,7 @@ def run_plan(args) -> None:
             page += 1
 
     with Spinner("Building service map (dtm / .gitmodules)..."):
-        service_map = build_service_map(args.org)
+        service_map = build_service_map(args.repo, args.org)
     plan = analyze(files, service_map, repo=args.repo)
     plan["pr_url"] = pr.get("html_url")
     plan["repo"] = args.repo
