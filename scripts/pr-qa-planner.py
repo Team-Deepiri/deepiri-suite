@@ -310,9 +310,6 @@ def install_from_github_release(gh_repo: str, binary_name: str, dest_dir: str | 
 # One generic package-manager table shared by every auto-installer in this
 # script, instead of the same if/elif "apt-get, dnf, pacman, snap, brew,
 # winget" chain hand-copied per tool (and each copy only covering a subset).
-# Note WSL needs no special-casing here: it runs a real Linux distro, so its
-# distro's normal manager (apt/dnf/pacman/zypper/...) already applies —
-# `platform.system()` correctly reports "Linux" inside WSL.
 PACKAGE_MANAGERS: list[tuple[str, list[str]]] = [
     ("brew", ["brew", "install", "{pkg}"]),
     ("apt-get", ["sudo", "apt-get", "install", "-y", "{pkg}"]),
@@ -327,15 +324,73 @@ PACKAGE_MANAGERS: list[tuple[str, list[str]]] = [
     ("scoop", ["scoop", "install", "{pkg}"]),
 ]
 
+# Which family in /etc/os-release's ID/ID_LIKE maps to which entry in
+# PACKAGE_MANAGERS above.
+_DISTRO_FAMILY_MANAGER = {
+    "debian": "apt-get", "ubuntu": "apt-get",
+    "fedora": "dnf", "rhel": "dnf", "centos": "dnf", "rocky": "dnf", "alma": "dnf",
+    "arch": "pacman", "manjaro": "pacman",
+    "suse": "zypper", "opensuse": "zypper",
+    "alpine": "apk",
+}
+
+
+def read_os_release() -> dict[str, str]:
+    """/etc/os-release is the freedesktop.org-standardized file every
+    modern Linux distro uses to declare its own identity (ID/ID_LIKE).
+    Reading it tells you deterministically which one package manager this
+    system actually uses, instead of probing a list of binary names to see
+    which "might" be present — this is *where the answer already is*, not
+    a guess. WSL needs no special-casing: it runs a real distro with its
+    own /etc/os-release, so this applies there unchanged."""
+    info: dict[str, str] = {}
+    if not os.path.isfile("/etc/os-release"):
+        return info
+    try:
+        with open("/etc/os-release") as f:
+            for line in f:
+                if "=" in line:
+                    k, _, v = line.strip().partition("=")
+                    info[k] = v.strip('"').strip("'")
+    except OSError:
+        pass
+    return info
+
+
+def detect_native_package_manager() -> str | None:
+    """The one package manager this specific OS/distro actually declares
+    as its own — macOS/Windows have no equivalent to os-release, but the
+    OS itself is the declaration there (Homebrew is the macOS convention;
+    winget ships with modern Windows)."""
+    system = platform.system()
+    if system == "Darwin":
+        return "brew"
+    if system == "Windows":
+        return "winget"
+    info = read_os_release()
+    ident = f"{info.get('ID', '')} {info.get('ID_LIKE', '')}".lower()
+    for family, manager in _DISTRO_FAMILY_MANAGER.items():
+        if family in ident:
+            return manager
+    return None
+
 
 def install_via_package_manager(pkg_names: dict[str, str], timeout: int = 180) -> bool:
-    """Try every package manager actually present on this machine, in the
-    order above, until one succeeds. `pkg_names` maps manager-binary -> the
-    package name for that manager (names sometimes differ, e.g. "ripgrep"
-    vs winget's "BurntSushi.ripgrep.MSVC") — a manager not present in
-    `pkg_names` is skipped even if it's installed, so callers only offer
-    managers they actually have a package name for."""
-    for binary, template in PACKAGE_MANAGERS:
+    """Try this OS's own declared native package manager first (read from
+    where its identity actually lives — /etc/os-release, or the OS itself
+    on macOS/Windows), then fall back to probing every other manager in
+    PACKAGE_MANAGERS for the rare case the native one isn't confirmed
+    present (containers missing os-release, an atypical install, etc.).
+    `pkg_names` maps manager-binary -> the package name for that manager
+    (names sometimes differ, e.g. "ripgrep" vs winget's
+    "BurntSushi.ripgrep.MSVC") — a manager not present in `pkg_names` is
+    skipped even if it's installed."""
+    native = detect_native_package_manager()
+    order = PACKAGE_MANAGERS
+    if native:
+        order = [pm for pm in PACKAGE_MANAGERS if pm[0] == native] + \
+                [pm for pm in PACKAGE_MANAGERS if pm[0] != native]
+    for binary, template in order:
         pkg = pkg_names.get(binary)
         if not pkg or not shutil.which(binary):
             continue
@@ -2344,8 +2399,40 @@ CLIPBOARD_TOOLS = [
 ]
 
 
+def detect_native_clipboard_tool() -> list[str] | None:
+    """Which clipboard tool this specific session actually declares as its
+    own — read from where that's already recorded, instead of probing
+    every tool in CLIPBOARD_TOOLS to see which "might" work:
+      - macOS: the OS itself is the declaration (pbcopy is built in)
+      - WSL: /proc/version declares "microsoft" — clip.exe is the interop
+        clipboard, reachable from a WSL shell
+      - Linux: $XDG_SESSION_TYPE (or the Wayland/X11 display env vars) is
+        the desktop session's own declaration of which display server —
+        and therefore which clipboard protocol — is in use
+    Falls back to None (caller probes CLIPBOARD_TOOLS) when none of these
+    signals are present."""
+    if platform.system() == "Darwin":
+        return ["pbcopy"]
+    try:
+        with open("/proc/version") as f:
+            if "microsoft" in f.read().lower():
+                return ["clip.exe"]
+    except OSError:
+        pass
+    session_type = os.environ.get("XDG_SESSION_TYPE", "").lower()
+    if session_type == "wayland" or os.environ.get("WAYLAND_DISPLAY"):
+        return ["wl-copy"]
+    if session_type == "x11" or os.environ.get("DISPLAY"):
+        return ["xclip", "-selection", "clipboard"]
+    return None
+
+
 def copy_to_clipboard(text: str) -> bool:
-    for cmd in CLIPBOARD_TOOLS:
+    native = detect_native_clipboard_tool()
+    tools = CLIPBOARD_TOOLS
+    if native:
+        tools = [native] + [t for t in CLIPBOARD_TOOLS if t[0] != native[0]]
+    for cmd in tools:
         if not shutil.which(cmd[0]):
             continue
         try:
