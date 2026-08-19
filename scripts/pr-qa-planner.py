@@ -1865,6 +1865,25 @@ def _copyable_text(raw: str) -> str:
     return codes[-1] if codes else raw.strip()
 
 
+AI_AGENT_PROMPT_TEMPLATE = """You are acting as a QA engineer testing a pull request. Below is a complete QA test plan generated for it — environment setup, exact commands to run (curl/docker/test), visual checks, and a checklist.
+
+Work through it end to end: run every command shown and note its actual output/exit status, open any URLs mentioned to check the UI, and check off each item as you complete it. If a command fails or a visual check looks wrong, say so specifically (what you expected vs. what happened) rather than just marking it failed. Finish with a summary: what passed, what failed, what needs a human to look at.
+
+--- QA TEST PLAN ---
+{plan_body}
+--- END OF PLAN ---
+
+Begin now."""
+
+
+def synthesize_ai_prompt(lines: list[dict]) -> str:
+    """Package the current state of the report (including any checkboxes
+    already toggled) into a single prompt an AI coding assistant can be
+    handed to execute the whole test plan."""
+    plan_body = "\n".join(_render_report_line(l) for l in lines)
+    return AI_AGENT_PROMPT_TEMPLATE.format(plan_body=plan_body)
+
+
 def _pick_export_path(stdscr, curses, start_dir: str, default_filename: str) -> str | None:
     """Inline mini file browser: navigate real directories from start_dir,
     Enter descends into a folder or (on the save entry) prompts for a
@@ -1986,8 +2005,8 @@ def run_interactive_report(md: str, export_path: str) -> bool:
                 except curses.error:
                     pass
 
-            footer = (" ↑/↓ or j/k move   space toggle   c copy   e export   q quit"
-                     f"   {status}")
+            footer = (" ↑/↓ or j/k move   space toggle   c copy   p AI prompt"
+                     f"   e export   q quit   {status}")
             try:
                 stdscr.addnstr(h - 1, 0, footer[:w - 1], max(0, w - 1), teal_attr)
             except curses.error:
@@ -2011,6 +2030,21 @@ def run_interactive_report(md: str, export_path: str) -> bool:
                 status = (f"[copied: {text_to_copy[:40]}{'...' if len(text_to_copy) > 40 else ''}]"
                          if copy_to_clipboard(text_to_copy)
                          else "[no clipboard tool found — install xclip/xsel/wl-copy/pbcopy]")
+            elif key == ord("p"):
+                prompt_text = synthesize_ai_prompt(lines)
+                if copy_to_clipboard(prompt_text):
+                    status = "[AI prompt copied to clipboard — paste into your assistant]"
+                else:
+                    chosen = _pick_export_path(stdscr, curses, os.getcwd(), "qa-plan-ai-prompt.txt")
+                    if chosen:
+                        try:
+                            with open(chosen, "w") as f:
+                                f.write(prompt_text + "\n")
+                            status = f"[no clipboard tool — saved prompt to {chosen} instead]"
+                        except OSError as e:
+                            status = f"[save failed: {e}]"
+                    else:
+                        status = "[no clipboard tool found, and export cancelled]"
             elif key == ord("e"):
                 chosen = _pick_export_path(stdscr, curses, os.getcwd(), default_filename)
                 if chosen:
