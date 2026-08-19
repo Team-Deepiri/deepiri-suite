@@ -375,6 +375,58 @@ def detect_native_package_manager() -> str | None:
     return None
 
 
+def repology_repo_hint() -> str | None:
+    """A substring to match against repology.org repo names for THIS
+    specific machine — derived from where the machine already declares its
+    own identity (the same os-release ID read_os_release() uses, e.g.
+    "ubuntu"/"fedora"/"arch", which is a literal substring of repology's
+    repo slugs like "ubuntu_24_04"/"fedora_40"/"arch"), not a hand-authored
+    manager -> repo-prefix mapping. macOS/Windows have no os-release, but
+    the OS itself is the declaration there — repology's repo for each is
+    just named "homebrew"/"winget"."""
+    system = platform.system()
+    if system == "Darwin":
+        return "homebrew"
+    if system == "Windows":
+        return "winget"
+    return (read_os_release().get("ID") or "").lower() or None
+
+
+def resolve_package_name_for_this_machine(repology_project: str, fallback: str) -> str:
+    """What `repology_project` is actually called in the ONE package repo
+    this specific machine uses, per repology.org's public API (a live
+    aggregator that already tracks package names across every major
+    repository) — instead of hand-typing manager-specific name variants
+    (pacman calls gh "github-cli", apt just calls it "gh", etc.). Only ever
+    resolves for the machine's own repo, not every manager pre-emptively,
+    so there's no per-manager table to maintain. Falls back to
+    `fallback` (the project's own plain name) if repology is unreachable
+    or has no entry for this machine's repo."""
+    hint = repology_repo_hint()
+    if not hint:
+        return fallback
+    try:
+        req = urllib.request.Request(
+            f"https://repology.org/api/v1/project/{repology_project}",
+            headers={"User-Agent": "pr-qa-planner (github.com/Team-Deepiri/deepiri-suite)"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            entries = json.loads(resp.read().decode())
+    except (urllib.error.URLError, OSError, json.JSONDecodeError, TimeoutError):
+        return fallback
+    for entry in entries:
+        if hint in entry.get("repo", "").lower():
+            # binnames is the actually-installable package name; srcname is
+            # the source package, which can differ (Debian's source package
+            # for ripgrep is "rust-ripgrep" but you `apt install ripgrep`,
+            # the binary package name) — prefer binnames.
+            binnames = entry.get("binnames") or []
+            name = (binnames[0] if binnames else None) or \
+                entry.get("srcname") or entry.get("visiblename")
+            if name:
+                return name
+    return fallback
+
+
 def install_via_package_manager(pkg_names: dict[str, str], timeout: int = 180) -> bool:
     """Try this OS's own declared native package manager first (read from
     where its identity actually lives — /etc/os-release, or the OS itself
@@ -406,14 +458,13 @@ def install_via_package_manager(pkg_names: dict[str, str], timeout: int = 180) -
 def _install_gh() -> bool:
     """Install the gh CLI. Tries the official prebuilt binary release first
     (no package-manager guessing needed at all), then falls back to
-    whichever package manager this machine actually has."""
+    whichever package manager this machine actually has, using the package
+    name repology.org reports for THIS machine's own repo (falling back to
+    the bare project name "gh" only if that lookup is unreachable)."""
     if install_from_github_release("cli/cli", "gh"):
         return True
-    if install_via_package_manager({
-        "brew": "gh", "apt-get": "gh", "dnf": "gh", "yum": "gh",
-        "pacman": "github-cli", "zypper": "gh", "apk": "github-cli",
-        "snap": "gh", "winget": "GitHub.cli", "choco": "gh", "scoop": "gh",
-    }):
+    pkg_name = resolve_package_name_for_this_machine("github-cli", "gh")
+    if install_via_package_manager({m: pkg_name for m, _ in PACKAGE_MANAGERS}):
         return True
     # apt's default repos don't carry `gh` on some releases — add the
     # official apt source (per https://cli.github.com/) and retry.
@@ -1630,11 +1681,9 @@ def ensure_rg_ready() -> bool:
         return True
     print("[setup] ripgrep ('rg') not found — attempting to install it...",
           file=sys.stderr)
-    ok = install_from_github_release("BurntSushi/ripgrep", "rg") or install_via_package_manager({
-        "brew": "ripgrep", "apt-get": "ripgrep", "dnf": "ripgrep", "yum": "ripgrep",
-        "pacman": "ripgrep", "zypper": "ripgrep", "apk": "ripgrep", "snap": "ripgrep",
-        "winget": "BurntSushi.ripgrep.MSVC", "choco": "ripgrep", "scoop": "ripgrep",
-    })
+    pkg_name = resolve_package_name_for_this_machine("ripgrep", "ripgrep")
+    ok = install_from_github_release("BurntSushi/ripgrep", "rg") or install_via_package_manager(
+        {m: pkg_name for m, _ in PACKAGE_MANAGERS})
     if not ok or shutil.which("rg") is None:
         print("[warn] could not auto-install ripgrep — --deep's cross-reference "
               "search will find nothing. Install manually: https://github.com/BurntSushi/ripgrep",
@@ -3044,6 +3093,21 @@ def run_regression_tests() -> bool:
               "_follows the `deepiri-qa-workflow` skill_", "text"))
     check("_is_command_carrier accepts a real command bullet",
           _is_command_carrier("  - `docker logs -f x`", "text"))
+
+    print("-- live checks (network; skipped on failure, not failed) --", file=sys.stderr)
+    try:
+        rg_name = resolve_package_name_for_this_machine("ripgrep", "ripgrep")
+        # Regression: repology's srcname for ripgrep on Debian/Ubuntu is
+        # "rust-ripgrep" (the source package) — `apt install rust-ripgrep`
+        # doesn't exist; the actual installable package is "ripgrep"
+        # (binnames). Caught live before this check existed. Only
+        # meaningful on a machine repology_repo_hint() can resolve.
+        if repology_repo_hint():
+            check("repology: this machine's package name is the "
+                 "installable binary name, not the source package name",
+                  rg_name == "ripgrep")
+    except Exception as e:
+        print(f"  [skip] repology check unavailable: {e}", file=sys.stderr)
 
     print("-- live checks (real GitHub PRs; skipped if gh isn't authenticated) --",
          file=sys.stderr)
