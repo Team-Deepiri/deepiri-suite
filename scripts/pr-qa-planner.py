@@ -2657,25 +2657,55 @@ def _show_output_pane(stdscr, curses, title: str, output: str, teal_attr) -> Non
             return
 
 
+def _looks_like_a_command(text: str) -> bool:
+    """A real command is a multi-token invocation (verb + args, e.g.
+    `docker logs -f x` or `pytest tests/foo.py -v`) — a bare identifier in
+    backticks like a branch name (`peytonli/fix/ui-ux-fixes`) or a file
+    path is a single token and isn't one, even though it's technically a
+    "code span" too."""
+    return " " in text.strip()
+
+
 def _is_command_carrier(raw: str, kind: str) -> bool:
     """A line actually carries a runnable command — not just prose that
-    happens to mention `something` in code font (e.g. "follows the
-    `deepiri-qa-workflow` skill"). Checkbox lines with an embedded command
-    (health-check/sorge-pass style) count; otherwise the line must itself be
-    a bullet ("  - `cmd`" / "    - `label`: `cmd`"), not narrative text."""
+    happens to mention `something` in code font, and not a metadata bullet
+    like "- **Branch:** `a` → `b`" whose backtick spans are bare
+    identifiers, not commands. Checkbox lines with an embedded command
+    (health-check/sorge-pass style) count; otherwise the line must itself
+    be a bullet ("  - `cmd`" / "    - `label`: `cmd`")."""
     if not BACKTICK_RE.search(raw):
+        return False
+    if not _looks_like_a_command(_copyable_text(raw)):
         return False
     if kind == "checkbox":
         return True
     return raw.strip().startswith("-")
 
 
-def run_guided_walkthrough(stdscr, curses, lines: list[dict], teal_attr) -> None:
+def _walkthrough_step_kind(line: dict, raw: str) -> str:
+    """Classify a step for the friendlier per-step framing: what kind of
+    action does this line actually ask for?"""
+    if _is_command_carrier(raw, line["kind"]):
+        return "command"
+    if URL_RE.search(raw):
+        return "visual"
+    return "checklist"
+
+
+_STEP_KIND_DISPLAY = {
+    "command": ("RUN A COMMAND", "green"),
+    "visual": ("VISUAL CHECK", "magenta"),
+    "checklist": ("CHECKLIST ITEM", "yellow"),
+}
+
+
+def run_guided_walkthrough(stdscr, curses, lines: list[dict], colors: dict) -> None:
     """Step through every actionable line one at a time: run its command
     inline (output shown in the same terminal, not a separate window), open
     a browser tab for anything with a URL (visual checks), or just mark a
     checklist item done, then move on. This is the "walk me through testing
-    this PR" ask."""
+    this PR" ask — each step is framed by what it's actually asking you to
+    do, not just a raw markdown line dump."""
     actionable = [i for i, l in enumerate(lines)
                  if l["kind"] == "checkbox" or _is_command_carrier(l["raw"], l["kind"])
                  or URL_RE.search(l["raw"])]
@@ -2690,15 +2720,47 @@ def run_guided_walkthrough(stdscr, curses, lines: list[dict], teal_attr) -> None
         is_runnable = (_is_command_carrier(raw, line["kind"])
                       and not cmd.lower().startswith(("http://", "https://")))
         url = _extract_url(raw)
+        step_kind = _walkthrough_step_kind(line, raw)
+        badge_text, badge_color_name = _STEP_KIND_DISPLAY[step_kind]
+        badge_attr = colors.get(badge_color_name, colors["teal"])
 
         stdscr.erase()
         h, w = stdscr.getmaxyx()
         stdscr.addnstr(0, 0, f" Guided walkthrough — step {idx + 1}/{len(actionable)}",
-                       max(0, w - 1), curses.A_BOLD)
+                       max(0, w - 1), colors["header"])
+        try:
+            stdscr.addnstr(1, 0, f" [{badge_text}]", max(0, w - 1), badge_attr | curses.A_REVERSE)
+        except curses.error:
+            pass
+        if line["kind"] == "checkbox":
+            mark = "[x] DONE" if line["checked"] else "[ ] not done yet"
+            try:
+                stdscr.addnstr(1, len(badge_text) + 5, f"  {mark}", max(0, w - 1),
+                               colors["checked"] if line["checked"] else curses.A_DIM)
+            except curses.error:
+                pass
+
+        # The question this step is actually asking, in plain language,
+        # instead of just dumping the raw markdown line.
+        question = {
+            "command": "Ready to run this?",
+            "visual": "Ready to open this in your browser and take a look?",
+            "checklist": "Mark this done once you've handled it.",
+        }[step_kind]
+        try:
+            stdscr.addnstr(3, 2, question, max(0, w - 3), curses.A_BOLD)
+        except curses.error:
+            pass
+
+        body_top = 5
         for i, chunk_start in enumerate(range(0, max(len(raw), 1), max(1, w - 4))):
-            if i + 2 >= h - 2:
+            if body_top + i >= h - 2:
                 break
-            stdscr.addnstr(i + 2, 2, raw[chunk_start:chunk_start + w - 4], max(0, w - 4))
+            try:
+                stdscr.addnstr(body_top + i, 2, raw[chunk_start:chunk_start + w - 4],
+                               max(0, w - 4))
+            except curses.error:
+                pass
 
         opts = []
         if line["kind"] == "checkbox":
@@ -2709,7 +2771,7 @@ def run_guided_walkthrough(stdscr, curses, lines: list[dict], teal_attr) -> None
             opts.append("o: open in browser")
         opts += ["n: next", "b: back", "q: exit walkthrough"]
         try:
-            stdscr.addnstr(h - 1, 0, "   ".join(opts)[:w - 1], max(0, w - 1), teal_attr)
+            stdscr.addnstr(h - 1, 0, "   ".join(opts)[:w - 1], max(0, w - 1), colors["teal"])
         except curses.error:
             pass
         stdscr.refresh()
@@ -2725,7 +2787,7 @@ def run_guided_walkthrough(stdscr, curses, lines: list[dict], teal_attr) -> None
             line["checked"] = not line["checked"]
         elif key == ord("r") and is_runnable:
             rc, output = _run_shell_capture(cmd)
-            _show_output_pane(stdscr, curses, f"$ {cmd}   (exit {rc})", output, teal_attr)
+            _show_output_pane(stdscr, curses, f"$ {cmd}   (exit {rc})", output, colors["teal"])
         elif key == ord("o") and url:
             try:
                 webbrowser.open(url)
@@ -2821,9 +2883,16 @@ def run_interactive_report(md: str, export_path: str, deep: dict | None = None) 
         curses.init_pair(1, curses.COLOR_CYAN, -1)
         curses.init_pair(2, curses.COLOR_BLUE, -1)
         curses.init_pair(3, curses.COLOR_GREEN, -1)
+        curses.init_pair(4, curses.COLOR_MAGENTA, -1)
+        curses.init_pair(5, curses.COLOR_YELLOW, -1)
         teal_attr = curses.color_pair(1) | curses.A_BOLD
         header_attr = curses.color_pair(2) | curses.A_BOLD
         checked_attr = curses.color_pair(3)
+        colors = {
+            "teal": teal_attr, "header": header_attr, "checked": checked_attr,
+            "magenta": curses.color_pair(4) | curses.A_BOLD,
+            "yellow": curses.color_pair(5) | curses.A_BOLD,
+        }
 
         top = 0
         cursor = 0  # index into `lines` — moves across every line, not just checkboxes
@@ -2897,7 +2966,7 @@ def run_interactive_report(md: str, export_path: str, deep: dict | None = None) 
                     else:
                         status = "[no clipboard tool found, and export cancelled]"
             elif key == ord("w"):
-                run_guided_walkthrough(stdscr, curses, lines, teal_attr)
+                run_guided_walkthrough(stdscr, curses, lines, colors)
                 status = "[walkthrough ended]"
             elif key == ord("e"):
                 chosen = _pick_export_path(stdscr, curses, os.getcwd(), default_filename)
@@ -3158,6 +3227,11 @@ def run_regression_tests() -> bool:
               "_follows the `deepiri-qa-workflow` skill_", "text"))
     check("_is_command_carrier accepts a real command bullet",
           _is_command_carrier("  - `docker logs -f x`", "text"))
+    check("_is_command_carrier rejects a metadata bullet with bare-"
+         "identifier backtick spans (branch names, not commands)",
+          not _is_command_carrier(
+              "- **Branch:** `peytonli/fix/ui-ux-fixes` → `peytonli/feat/ai-prompt-loop`",
+              "text"))
 
     print("-- live checks (network; skipped on failure, not failed) --", file=sys.stderr)
     try:
