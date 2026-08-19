@@ -1092,6 +1092,53 @@ def find_service_info(compose_root: str, short_repo: str) -> dict | None:
     return None
 
 
+_COMPOSE_CMD: str | None = None
+
+
+def detect_compose_command() -> str:
+    """Docker Compose ships two incompatible invocations depending on the
+    install: the v2 plugin ('docker compose', space) or the legacy
+    standalone v1 binary ('docker-compose', hyphen). Detect which this
+    machine actually has instead of assuming one."""
+    global _COMPOSE_CMD
+    if _COMPOSE_CMD is not None:
+        return _COMPOSE_CMD
+    if shutil.which("docker"):
+        try:
+            r = subprocess.run(["docker", "compose", "version"],
+                               capture_output=True, text=True, timeout=5)
+            if r.returncode == 0:
+                _COMPOSE_CMD = "docker compose"
+                return _COMPOSE_CMD
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+    if shutil.which("docker-compose"):
+        _COMPOSE_CMD = "docker-compose"
+        return _COMPOSE_CMD
+    _COMPOSE_CMD = "docker compose"  # neither detectable — most common default
+    return _COMPOSE_CMD
+
+
+def build_docker_commands(service_info: dict | None) -> list[str]:
+    """Standard debug commands for one service's container. `docker logs`/
+    `exec`/`compose restart` are the Docker CLI's own fixed vocabulary (no
+    "dynamic source" for a tool's own command names, same as `curl -X` or
+    `git checkout`) — but the compose invocation style and the container's
+    shell genuinely vary by environment, so those are detected live rather
+    than assumed."""
+    if not service_info:
+        return []
+    compose_cmd = detect_compose_command()
+    container = service_info["container_name"]
+    return [
+        f"docker logs -f {container}",
+        # bash if the image has it, falling back to sh (busybox/alpine
+        # images usually don't ship bash) — tried live, not assumed.
+        f"docker exec -it {container} bash || docker exec -it {container} sh",
+        f"{compose_cmd} -f {service_info['compose_file']} restart {service_info['service_key']}",
+    ]
+
+
 def find_frontend_dev_port(repo_path: str) -> str | None:
     """Read the actual dev-server port straight out of the repo's own
     package.json/vite config — no hardcoded default like 3000."""
@@ -1379,15 +1426,95 @@ def _scan_one_file(root: str, rev: str, path: str, cd_path: str, js_runner: str 
     }
 
 
+def fetch_repo_file_remote(repo: str, ref: str, path: str) -> str | None:
+    """A file's content straight from the GitHub API at a specific commit —
+    no local clone needed. Used when the analyzed repo has no local
+    checkout, so --deep still produces real commands instead of just
+    telling the user to go clone something first."""
+    r = gh("api", f"repos/{repo}/contents/{path}?ref={ref}", "--jq", ".content")
+    if r.returncode != 0 or not r.stdout.strip():
+        return None
+    import base64
+    try:
+        return base64.b64decode(r.stdout.strip()).decode("utf-8", errors="replace")
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+
+def deep_analyze_remote(repo: str, files: list[dict], head_sha: str) -> dict:
+    """Deep scan without any local checkout — fetches each changed file's
+    content via the GitHub API instead. Gets routes/symbols/visual-checks
+    (real commands you can actually run) but not the rg-based cross-
+    reference search (who-else-references-this needs a full local tree to
+    grep, which a single-file remote fetch can't provide)."""
+    compose_root = find_compose_root()
+    short = repo.split("/")[-1]
+    service_info = find_service_info(compose_root, short) if compose_root else None
+    backend_port = service_info["port"] if service_info else None
+    docker_commands = build_docker_commands(service_info)
+
+    frontend_port_state: list[str] = []
+    pkg_json_cache: dict[str, str | None] = {}
+
+    def remote_frontend_port() -> str | None:
+        if "content" not in pkg_json_cache:
+            pkg_json_cache["content"] = fetch_repo_file_remote(repo, head_sha, "package.json")
+        content = pkg_json_cache["content"]
+        if not content:
+            return None
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError:
+            return None
+        dev_script = (data.get("scripts", {}) or {}).get("dev", "")
+        m = re.search(r"--port[= ](\d+)", dev_script)
+        return m.group(1)
+
+    changed = []
+    for f in files:
+        path = f["filename"]
+        if not path.endswith((".py", ".ts", ".tsx", ".js", ".jsx")):
+            continue
+        content = fetch_repo_file_remote(repo, head_sha, path)
+        if content is None:
+            continue
+        syms = extract_symbols(content, path)
+        routes = extract_routes(content, path)
+        route_commands = [(m, p, route_to_curl(m, p, backend_port)) for m, p in routes]
+        visual_checks = []
+        if is_frontend_path(path):
+            if not frontend_port_state:
+                frontend_port_state.append(remote_frontend_port() or "")
+            frontend_port = frontend_port_state[0]
+            named_syms = [s for s in syms if s not in GENERIC_SYMBOLS]
+            if named_syms:
+                dev_url = (f"http://localhost:{frontend_port}" if frontend_port
+                          else "the dev server (port not found remotely - check this repo's own dev-server setup)")
+                for s in named_syms:
+                    visual_checks.append(
+                        f"Open {dev_url} and visually verify `{s}` (changed in `{path}`) - "
+                        "check it renders, layout/spacing look right, no console errors."
+                    )
+        changed.append({
+            "path": path, "symbols": syms, "imports": extract_imports(content),
+            "neighbors": [], "users": [], "tests": [], "test_commands": [],
+            "routes": route_commands, "visual_checks": visual_checks,
+        })
+
+    return {"available": True, "repo_path": f"{repo} (remote — no local checkout, fetched via GitHub API)",
+            "head_sha": head_sha, "files": changed, "docker_commands": docker_commands,
+            "remote_only": True}
+
+
 def deep_analyze(repo: str, pr: dict, files: list[dict], workspace: str | None) -> dict:
     """Scan the local repo for what specifically exercises the changed code."""
     short = repo.split("/")[-1]
     root = repo_root_hint(repo)
     head_sha = pr.get("head", {}).get("sha")
-    if not root or head_sha is None:
-        return {"available": False, "reason": "no_local_repo",
-                "clone_hint": f"git clone https://github.com/{repo}.git && "
-                              f"git -C {short} fetch origin {pr.get('head', {}).get('ref', '')}"}
+    if head_sha is None:
+        return {"available": False, "reason": "no_head_sha"}
+    if not root:
+        return deep_analyze_remote(repo, files, head_sha)
 
     if git_rev(root, head_sha) is None:
         r = subprocess.run(["git", "-C", root, "fetch", "origin",
@@ -1407,13 +1534,7 @@ def deep_analyze(repo: str, pr: dict, files: list[dict], workspace: str | None) 
     compose_root = root if find_compose_files(root) else find_compose_root()
     service_info = find_service_info(compose_root, short) if compose_root else None
     backend_port = service_info["port"] if service_info else None
-    docker_commands = []
-    if service_info:
-        docker_commands = [
-            f"docker logs -f {service_info['container_name']}",
-            f"docker exec -it {service_info['container_name']} sh",
-            f"docker compose -f {service_info['compose_file']} restart {service_info['service_key']}",
-        ]
+    docker_commands = build_docker_commands(service_info)
     # Frontend dev-server port: read live from this repo's own package.json/
     # vite config — computed lazily, only if a frontend file actually changed.
     frontend_port_state: list[str] = []  # lazily-filled 0/1-item cache slot
@@ -1457,12 +1578,9 @@ def deep_analyze(repo: str, pr: dict, files: list[dict], workspace: str | None) 
         sub_js_runner = detect_js_test_runner(sub_root)
         sub_service_info = find_service_info(compose_root, sub_short) if compose_root else None
         sub_backend_port = sub_service_info["port"] if sub_service_info else None
-        if sub_service_info:
-            for cmd_ in (f"docker logs -f {sub_service_info['container_name']}",
-                        f"docker exec -it {sub_service_info['container_name']} sh",
-                        f"docker compose -f {sub_service_info['compose_file']} restart {sub_service_info['service_key']}"):
-                if cmd_ not in docker_commands:
-                    docker_commands.append(cmd_)
+        for cmd_ in build_docker_commands(sub_service_info):
+            if cmd_ not in docker_commands:
+                docker_commands.append(cmd_)
         for sp in sub_changed_paths:
             entry = _scan_one_file(sub_root, new_sha, sp, sub_cd_path, sub_js_runner,
                                    sub_backend_port, frontend_port_state)
@@ -1477,14 +1595,19 @@ def deep_analyze(repo: str, pr: dict, files: list[dict], workspace: str | None) 
 def render_deep(deep: dict) -> list[str]:
     lines = []
     if not deep.get("available"):
-        lines.append("> **Deep scan:** no local checkout of this repo found. "
-                     f"Clone it first so the plan can find what to test:\n>\n"
-                     f"> ```bash\n> {deep.get('clone_hint')}\n> ```")
+        lines.append("> **Deep scan unavailable:** couldn't resolve this PR's head commit.")
         return lines
-    lines.append("#### What to test (deep scan of local code)")
+    lines.append("#### What to test (deep scan)")
     lines.append("")
-    lines.append(f"_Scanned `{deep.get('repo_path')}` at `{deep.get('head_sha', '')[:8]}` "
-                 "— only changed files parsed, references found via ripgrep._")
+    if deep.get("remote_only"):
+        lines.append(f"_Scanned `{deep.get('repo_path')}` at `{deep.get('head_sha', '')[:8]}` "
+                     "— no local checkout found, so this fetched each changed file's content "
+                     "directly via the GitHub API. Routes/visual-checks below are real; "
+                     "cross-reference search (who else calls this, which test exercises it) "
+                     "needs a local clone to grep across, so that part is skipped here._")
+    else:
+        lines.append(f"_Scanned `{deep.get('repo_path')}` at `{deep.get('head_sha', '')[:8]}` "
+                     "— only changed files parsed, references found via ripgrep._")
     lines.append("")
     if deep.get("docker_commands"):
         lines.append("- **Service commands (docker):**")
@@ -1938,6 +2061,19 @@ def _show_output_pane(stdscr, curses, title: str, output: str, teal_attr) -> Non
             return
 
 
+def _is_command_carrier(raw: str, kind: str) -> bool:
+    """A line actually carries a runnable command — not just prose that
+    happens to mention `something` in code font (e.g. "follows the
+    `deepiri-qa-workflow` skill"). Checkbox lines with an embedded command
+    (health-check/sorge-pass style) count; otherwise the line must itself be
+    a bullet ("  - `cmd`" / "    - `label`: `cmd`"), not narrative text."""
+    if not BACKTICK_RE.search(raw):
+        return False
+    if kind == "checkbox":
+        return True
+    return raw.strip().startswith("-")
+
+
 def run_guided_walkthrough(stdscr, curses, lines: list[dict], teal_attr) -> None:
     """Step through every actionable line one at a time: run its command
     inline (output shown in the same terminal, not a separate window), open
@@ -1945,7 +2081,7 @@ def run_guided_walkthrough(stdscr, curses, lines: list[dict], teal_attr) -> None
     checklist item done, then move on. This is the "walk me through testing
     this PR" ask."""
     actionable = [i for i, l in enumerate(lines)
-                 if l["kind"] == "checkbox" or BACKTICK_RE.search(l["raw"])
+                 if l["kind"] == "checkbox" or _is_command_carrier(l["raw"], l["kind"])
                  or URL_RE.search(l["raw"])]
     if not actionable:
         return
@@ -1955,7 +2091,8 @@ def run_guided_walkthrough(stdscr, curses, lines: list[dict], teal_attr) -> None
         line = lines[li]
         raw = _render_report_line(line)
         cmd = _copyable_text(raw)
-        is_runnable = bool(BACKTICK_RE.search(raw)) and not cmd.lower().startswith(("http://", "https://"))
+        is_runnable = (_is_command_carrier(raw, line["kind"])
+                      and not cmd.lower().startswith(("http://", "https://")))
         url = _extract_url(raw)
 
         stdscr.erase()
