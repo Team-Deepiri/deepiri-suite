@@ -1135,6 +1135,10 @@ def analyze(files: list[dict], service_map: list[tuple[str, str, str]],
         "rebuild_needed": rebuild_needed,
         "frontend_touched": any("web-frontend" in p or "frontend" in p for p in low_paths),
         "backend_touched": any("platform-services/backend" in p or "backend" in p for p in low_paths),
+        "frontend_paths": sorted(f for f, low in zip(all_paths, low_paths)
+                                 if "web-frontend" in low or "frontend" in low),
+        "backend_paths": sorted(f for f, low in zip(all_paths, low_paths)
+                                if "platform-services/backend" in low or "backend" in low),
     }
 
 
@@ -1226,13 +1230,39 @@ def render_markdown(plan: dict, pr: dict, repo: str) -> str:
                  "still initializing produces false PR failures.")
     lines.append("- [ ] **Sorge bot pass:** comment `/sorge` on the PR; treat it as a "
                  "first pass that informs (not replaces) manual review.")
-    if plan["frontend_touched"]:
+    deep = plan.get("deep")
+    deep_files = deep.get("files", []) if deep and deep.get("available") else []
+    route_files = [cf for cf in deep_files if cf.get("routes")]
+    visual_files = [cf for cf in deep_files if cf.get("visual_checks")]
+    # A file with real extracted routes/visual-checks is definitive backend/
+    # frontend signal from the actual diff — catches cases the path-substring
+    # heuristic misses (e.g. a backend service under a path with neither
+    # "backend" nor "frontend" in it, like services/orchestrator/).
+    frontend_touched = plan["frontend_touched"] or bool(visual_files)
+    backend_touched = plan["backend_touched"] or bool(route_files)
+
+    if frontend_touched:
         lines.append("- [ ] **Frontend:** verify UI/UX against the design spec, not "
                      "just that the page loads.")
-    if plan["backend_touched"]:
+        if plan.get("frontend_paths"):
+            preview = ", ".join(f"`{p}`" for p in plan["frontend_paths"][:8])
+            if len(plan["frontend_paths"]) > 8:
+                preview += f", … +{len(plan['frontend_paths']) - 8} more"
+            lines.append(f"  - Frontend files changed: {preview}")
+    if backend_touched:
         lines.append("- [ ] **Backend:** verify functional requirements and data "
                      "integrity — what the change actually persists or returns, not "
                      "just that the endpoint responds.")
+        if route_files:
+            lines.append("  - Specific endpoints changed in this PR — test these directly:")
+            for cf in route_files:
+                for method, route_path, curl_cmd in cf["routes"]:
+                    lines.append(f"    - `{method} {route_path}` (changed in `{cf['path']}`): `{curl_cmd}`")
+        elif plan.get("backend_paths"):
+            preview = ", ".join(f"`{p}`" for p in plan["backend_paths"][:8])
+            if len(plan["backend_paths"]) > 8:
+                preview += f", … +{len(plan['backend_paths']) - 8} more"
+            lines.append(f"  - Backend files changed: {preview}")
     lines.append("")
     lines.append("#### Areas affected")
     lines.append("")
