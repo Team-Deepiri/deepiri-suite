@@ -49,6 +49,7 @@ and auto-installs it via the platform's package manager if missing, then
 runs `gh auth login` if not authenticated. Stdlib only otherwise.
 """
 import argparse
+import base64
 import glob
 import http
 import itertools
@@ -1218,8 +1219,6 @@ def render_markdown(plan: dict, pr: dict, repo: str) -> str:
                  f"`bash setup-deepiri-dev.sh --team qa "
                  f"{'--build ' if plan['rebuild_needed'] else ''}[--tier 1|2|3]` — "
                  f"**{('rebuild required (lockfile/Dockerfile/submodule changes - add `--build` so stale images are not reused)') if plan['rebuild_needed'] else 'no rebuild needed, omit `--build`'}**")
-    lines.append("- Tear down when done: `docker compose -f docker-compose.dev.yml down` "
-                 "— don't leave stacks running between PRs.")
     lines.append("")
 
     # Phase 3 — Verification and testing
@@ -1234,12 +1233,22 @@ def render_markdown(plan: dict, pr: dict, repo: str) -> str:
     deep_files = deep.get("files", []) if deep and deep.get("available") else []
     route_files = [cf for cf in deep_files if cf.get("routes")]
     visual_files = [cf for cf in deep_files if cf.get("visual_checks")]
-    # A file with real extracted routes/visual-checks is definitive backend/
-    # frontend signal from the actual diff — catches cases the path-substring
-    # heuristic misses (e.g. a backend service under a path with neither
-    # "backend" nor "frontend" in it, like services/orchestrator/).
+    # A .py file is backend by language regardless of what its path happens
+    # to contain — the plain "backend" in p substring check below is a false
+    # positive on a *frontend* file like backendApi.ts (an API client, not a
+    # backend service) and a false negative on a real backend file with
+    # neither "backend" nor "frontend" anywhere in its path (e.g.
+    # services/orchestrator/app/db_repos.py). Symbol-bearing .py files
+    # without a detected route (a plain function like `delete_project`, not
+    # behind an HTTP decorator) still need their own specific callout below,
+    # not silence just because there's no route to build a curl command for.
+    route_file_paths = {cf["path"] for cf in route_files}
+    backend_symbol_files = [cf for cf in deep_files
+                            if cf["path"].endswith(".py") and cf["path"] not in route_file_paths
+                            and not TEST_FILE_PATH_RE.search(cf["path"])
+                            and any(s not in GENERIC_SYMBOLS for s in cf.get("symbols", []))]
     frontend_touched = plan["frontend_touched"] or bool(visual_files)
-    backend_touched = plan["backend_touched"] or bool(route_files)
+    backend_touched = plan["backend_touched"] or bool(route_files) or bool(backend_symbol_files)
 
     if frontend_touched:
         lines.append("- [ ] **Frontend:** verify UI/UX against the design spec, not "
@@ -1258,7 +1267,21 @@ def render_markdown(plan: dict, pr: dict, repo: str) -> str:
             for cf in route_files:
                 for method, route_path, curl_cmd in cf["routes"]:
                     lines.append(f"    - `{method} {route_path}` (changed in `{cf['path']}`): `{curl_cmd}`")
-        elif plan.get("backend_paths"):
+        if backend_symbol_files:
+            lines.append("  - Specific functions changed in this PR — verify what each "
+                         "one actually persists/returns, not just that it runs without "
+                         "throwing:")
+            # One checkbox per file, not plain sub-bullets: the guided
+            # walkthrough only gives a line its own step when it's a
+            # checkbox, carries a runnable command, or has a URL — a plain
+            # bullet whose only code spans are a symbol name and a file
+            # path satisfies none of those and was silently skipped, so the
+            # static report showed these verifications but the walkthrough
+            # jumped straight past them to the next npm test.
+            for cf in backend_symbol_files:
+                named = ", ".join(s for s in cf["symbols"] if s not in GENERIC_SYMBOLS)
+                lines.append(f"    - [ ] `{named}` (changed in `{cf['path']}`)")
+        if not route_files and not backend_symbol_files and plan.get("backend_paths"):
             preview = ", ".join(f"`{p}`" for p in plan["backend_paths"][:8])
             if len(plan["backend_paths"]) > 8:
                 preview += f", … +{len(plan['backend_paths']) - 8} more"
@@ -1294,7 +1317,16 @@ def render_markdown(plan: dict, pr: dict, repo: str) -> str:
 
     lines.append("#### Manual QA checklist")
     lines.append("")
-    lines.append("- [ ] Run the per-area test commands above")
+    # One concrete, runnable checkbox per area instead of a vague "run the
+    # commands above" pointer at a markdown table — table rows ("| ... |")
+    # never register as walkthrough steps (only checkbox/bulleted lines with
+    # an embedded backtick command do), so that pointer was never actually
+    # actionable inside the guided walkthrough. Each area's own real test
+    # command (from plan["areas"], the same live data the table above uses)
+    # is embedded directly so `r` can run it.
+    for label, area in sorted(plan["areas"].items()):
+        cmd = (area.get("test_command") or "manual").replace("|", "\\|")
+        lines.append(f"- [ ] **{label}:** `{cmd}`")
     lines.append("- [ ] Smoke-test the primary user flows touched by this change")
     lines.append("- [ ] Check for regressions in adjacent services (shared-lib changes ripple)")
     lines.append("- [ ] Confirm no secrets/credentials were introduced")
@@ -1336,6 +1368,15 @@ def render_markdown(plan: dict, pr: dict, repo: str) -> str:
     for f in sorted(plan["areas"].get("(unknown / other)", {}).get("files", [])):
         lines.append(f"- `{f}`")
     lines.append("</details>")
+    lines.append("")
+
+    # Wrap-up — last step, not a Phase 2 setup note, so the guided
+    # walkthrough presents it after everything else instead of right after
+    # the environment stands up.
+    lines.append("### When you're done")
+    lines.append("")
+    lines.append("- Tear down: `docker compose -f docker-compose.dev.yml down` "
+                 "— don't leave stacks running between PRs.")
     return "\n".join(lines)
 
 
@@ -1398,6 +1439,24 @@ FRONTEND_PATH_HINTS = (".tsx", ".jsx", "/components/", "/pages/", "/views/", "/s
 GENERIC_SYMBOLS = {"logger", "log", "prisma", "redis", "router", "app",
                    "server", "db", "client", "config", "utils", "helper",
                    "index", "request", "response", "req", "res", "express"}
+
+# Test files (pytest/unittest conventions) — their symbols are verified by
+# running them, which the plan already covers via each area's test command
+# and the deep scan's "Tests that exercise it" section. Listing every test
+# class/function as a hand-verification checkbox buried the real manual-QA
+# items under dozens of rows no human acts on one by one.
+TEST_FILE_PATH_RE = re.compile(
+    r"(^|/)(tests?|__tests__|specs?)/|(^|/)conftest\.py$"
+    r"|(^|/)test_[^/]*\.py$|_test\.py$")
+
+
+def added_lines_from_patch(patch: str) -> str:
+    """Just the added lines of a unified diff, "+" stripped — so symbol/route
+    extraction reflects what this PR actually changed, not everything that
+    happens to be defined in the whole file (a one-line tweak to a 40-export
+    API client file would otherwise list all 40 exports as "changed")."""
+    return "\n".join(line[1:] for line in patch.splitlines()
+                     if line.startswith("+") and not line.startswith("+++"))
 
 
 def extract_symbols(content: str, path: str) -> list[str]:
@@ -1808,20 +1867,36 @@ def diff_files_between(repo_path: str, old_rev: str, new_rev: str) -> list[str]:
     return [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
 
 
+def diff_patch_for_path(repo_path: str, old_rev: str, new_rev: str, path: str) -> str:
+    """The unified diff for one path between two local revisions — the
+    submodule-bump equivalent of a PR file's `patch` field from the GitHub
+    API, so symbol/route extraction can scope to added lines here too."""
+    try:
+        r = subprocess.run(["git", "-C", repo_path, "diff", old_rev, new_rev, "--", path],
+                           capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        return ""
+    return r.stdout if r.returncode == 0 else ""
+
+
 def _scan_one_file(root: str, rev: str, path: str, cd_path: str, js_runner: str | None,
-                    backend_port: str | None, frontend_port_state: list[str]) -> dict | None:
+                    backend_port: str | None, frontend_port_state: list[str],
+                    patch: str = "") -> dict | None:
     """The per-file deep-scan logic, shared between the PR's own changed
     files and files changed inside a bumped submodule's diff.
     `frontend_port_state` is a shared 0/1-item list used as a lazily-filled
-    cache slot for the frontend dev port across repeated calls."""
+    cache slot for the frontend dev port across repeated calls. `patch`, when
+    available, scopes symbol/route extraction to the lines this PR actually
+    added instead of everything defined in the whole file."""
     if not path.endswith((".py", ".ts", ".tsx", ".js", ".jsx")):
         return None
     content = git_show_file(root, rev, path)
     if content is None:
         return None
-    syms = extract_symbols(content, path)
+    changed_content = added_lines_from_patch(patch) if patch else content
+    syms = extract_symbols(changed_content, path)
     imports = extract_imports(content)
-    routes = extract_routes(content, path)
+    routes = extract_routes(changed_content, path)
     route_commands = [(m, p, route_to_curl(m, p, backend_port)) for m, p in routes]
 
     visual_checks = []
@@ -1943,8 +2018,9 @@ def deep_analyze_remote(repo: str, files: list[dict], head_sha: str) -> dict:
         content = fetch_repo_file_remote(repo, head_sha, path)
         if content is None:
             continue
-        syms = extract_symbols(content, path)
-        routes = extract_routes(content, path)
+        changed_content = added_lines_from_patch(f.get("patch") or "") or content
+        syms = extract_symbols(changed_content, path)
+        routes = extract_routes(changed_content, path)
         route_commands = [(m, p, route_to_curl(m, p, backend_port)) for m, p in routes]
         visual_checks = []
         if is_frontend_path(path):
@@ -2098,7 +2174,7 @@ def deep_analyze(repo: str, pr: dict, files: list[dict], workspace: str | None) 
     context = ContextCollector()
     for f in files:
         entry = _scan_one_file(root, head_sha, f["filename"], cd_path, js_runner,
-                               backend_port, frontend_port_state)
+                               backend_port, frontend_port_state, f.get("patch") or "")
         if entry:
             context.add_from_entry(root, head_sha, entry, entry["path"])
             changed.append(entry)
@@ -2140,8 +2216,9 @@ def deep_analyze(repo: str, pr: dict, files: list[dict], workspace: str | None) 
             if cmd_ not in docker_commands:
                 docker_commands.append(cmd_)
         for sp in sub_changed_paths:
+            sub_patch = diff_patch_for_path(sub_root, old_sha, new_sha, sp)
             entry = _scan_one_file(sub_root, new_sha, sp, sub_cd_path, sub_js_runner,
-                                   sub_backend_port, frontend_port_state)
+                                   sub_backend_port, frontend_port_state, sub_patch)
             if entry:
                 context.add_from_entry(sub_root, new_sha, entry, sp)
                 entry["path"] = f"{sub_path}/{sp}"
@@ -2526,62 +2603,55 @@ def _render_report_line(line: dict) -> str:
 
 BACKTICK_RE = re.compile(r"`([^`]+)`")
 
-CLIPBOARD_TOOLS = [
-    ["xclip", "-selection", "clipboard"],
-    ["xsel", "--clipboard", "--input"],
-    ["wl-copy"],
-    ["pbcopy"],
-    ["clip.exe"],
-]
+# OSC 52 payloads this large start hitting real terminal/multiplexer caps
+# (iTerm2/tmux default to ~1MB of raw sequence, i.e. well under this after
+# base64 overhead) — past this, sending it would either get silently
+# dropped by the terminal or truncate the clipboard content, so skip
+# straight to falling back rather than doing that.
+OSC52_MAX_BYTES = 200_000
 
 
-def detect_native_clipboard_tool() -> list[str] | None:
-    """Which clipboard tool this specific session actually declares as its
-    own — read from where that's already recorded, instead of probing
-    every tool in CLIPBOARD_TOOLS to see which "might" work:
-      - macOS: the OS itself is the declaration (pbcopy is built in)
-      - WSL: /proc/version declares "microsoft" — clip.exe is the interop
-        clipboard, reachable from a WSL shell
-      - Linux: $XDG_SESSION_TYPE (or the Wayland/X11 display env vars) is
-        the desktop session's own declaration of which display server —
-        and therefore which clipboard protocol — is in use
-    Falls back to None (caller probes CLIPBOARD_TOOLS) when none of these
-    signals are present."""
-    if platform.system() == "Darwin":
-        return ["pbcopy"]
-    try:
-        with open("/proc/version") as f:
-            if "microsoft" in f.read().lower():
-                return ["clip.exe"]
-    except OSError:
-        pass
-    session_type = os.environ.get("XDG_SESSION_TYPE", "").lower()
-    if session_type == "wayland" or os.environ.get("WAYLAND_DISPLAY"):
-        return ["wl-copy"]
-    if session_type == "x11" or os.environ.get("DISPLAY"):
-        return ["xclip", "-selection", "clipboard"]
-    return None
+def _osc52_copy(text: str) -> bool:
+    """Ask the terminal itself to set its clipboard, over the same
+    stdout/tty channel already in use — no external tool, no package
+    install, no sudo. This is a terminal-emulator feature, not an OS one, so
+    it works identically on Linux, WSL, and macOS as long as the terminal
+    supports OSC 52 (iTerm2, Kitty, WezTerm, Alacritty, Windows Terminal,
+    foot, and modern xterm/gnome-terminal/tmux all do) — and unlike
+    xclip/pbcopy it keeps working over SSH, since the sequence rides the
+    existing terminal connection back to wherever the terminal itself is
+    running, not the remote host."""
+    data = text.encode("utf-8")
+    if len(data) > OSC52_MAX_BYTES:
+        return False
+    seq = f"\x1b]52;c;{base64.b64encode(data).decode('ascii')}\x07"
+    if os.environ.get("TMUX") or os.environ.get("TERM", "").startswith("screen"):
+        # tmux/screen swallow OSC sequences aimed at their own pane instead
+        # of passing them through — DCS passthrough re-wraps it so the
+        # outer terminal (the one actually holding the clipboard) sees it.
+        seq = "\x1bPtmux;" + seq.replace("\x1b", "\x1b\x1b") + "\x1b\\"
+    for target in ("/dev/tty", None):
+        try:
+            if target:
+                with open(target, "w") as tty:
+                    tty.write(seq)
+                    tty.flush()
+            else:
+                sys.stdout.write(seq)
+                sys.stdout.flush()
+            return True
+        except OSError:
+            continue
+    return False
 
 
 def copy_to_clipboard(text: str) -> bool:
-    native = detect_native_clipboard_tool()
-    tools = CLIPBOARD_TOOLS
-    if native:
-        tools = [native] + [t for t in CLIPBOARD_TOOLS if t[0] != native[0]]
-    for cmd in tools:
-        if not shutil.which(cmd[0]):
-            continue
-        try:
-            # xclip/xsel hang indefinitely if there's no working X display
-            # (headless/SSH session, $DISPLAY unset) — a hard timeout keeps
-            # a bad clipboard tool from freezing the whole interactive UI.
-            r = subprocess.run(cmd, input=text, text=True, capture_output=True,
-                               timeout=3)
-        except (OSError, subprocess.TimeoutExpired):
-            continue
-        if r.returncode == 0:
-            return True
-    return False
+    """OSC 52 only — hand the bytes straight to the terminal over the
+    existing stdout/tty channel. No xclip/xsel/wl-copy/pbcopy probing, no
+    package install, no sudo: one path that works the same on Linux, WSL,
+    and macOS, and keeps working over SSH since it never touches the
+    remote host's own clipboard state at all."""
+    return _osc52_copy(text)
 
 
 def _copyable_text(raw: str) -> str:
@@ -2692,8 +2762,15 @@ def _looks_like_a_command(text: str) -> bool:
     `docker logs -f x` or `pytest tests/foo.py -v`) — a bare identifier in
     backticks like a branch name (`peytonli/fix/ui-ux-fixes`) or a file
     path is a single token and isn't one, even though it's technically a
-    "code span" too."""
-    return " " in text.strip()
+    "code span" too. A comma-separated span (`fooBar, bazQux, quux`) is a
+    listing of names — symbols, imports, reverse-references — not an
+    invocation; no shell command takes its positional args that way, so a
+    comma anywhere in the span rules it out regardless of which report
+    section produced it."""
+    text = text.strip()
+    if "," in text:
+        return False
+    return " " in text
 
 
 def _is_command_carrier(raw: str, kind: str) -> bool:
@@ -2729,6 +2806,17 @@ _STEP_KIND_DISPLAY = {
 }
 
 
+def _is_walkthrough_step(line: dict) -> bool:
+    """Does this parsed report line earn its own guided-walkthrough step?
+    One predicate, shared between step collection and the regression suite —
+    it used to exist only inline inside run_guided_walkthrough(), so markdown
+    changes could silently drop steps from the walkthrough while the static
+    report still showed them."""
+    return (line["kind"] == "checkbox"
+            or _is_command_carrier(line["raw"], line["kind"])
+            or bool(URL_RE.search(line["raw"])))
+
+
 def run_guided_walkthrough(stdscr, curses, lines: list[dict], colors: dict) -> None:
     """Step through every actionable line one at a time: run its command
     inline (output shown in the same terminal, not a separate window), open
@@ -2736,9 +2824,7 @@ def run_guided_walkthrough(stdscr, curses, lines: list[dict], colors: dict) -> N
     checklist item done, then move on. This is the "walk me through testing
     this PR" ask — each step is framed by what it's actually asking you to
     do, not just a raw markdown line dump."""
-    actionable = [i for i, l in enumerate(lines)
-                 if l["kind"] == "checkbox" or _is_command_carrier(l["raw"], l["kind"])
-                 or URL_RE.search(l["raw"])]
+    actionable = [i for i, l in enumerate(lines) if _is_walkthrough_step(l)]
     if not actionable:
         return
     idx = 0
@@ -2799,7 +2885,7 @@ def run_guided_walkthrough(stdscr, curses, lines: list[dict], colors: dict) -> N
             opts.append("r: run this command")
         if url:
             opts.append("o: open in browser")
-        opts += ["n: next", "b: back", "q: exit walkthrough"]
+        opts += ["← back", "→ next", "q: exit walkthrough"]
         try:
             stdscr.addnstr(h - 1, 0, "   ".join(opts)[:w - 1], max(0, w - 1), colors["teal"])
         except curses.error:
@@ -2809,15 +2895,32 @@ def run_guided_walkthrough(stdscr, curses, lines: list[dict], colors: dict) -> N
         key = stdscr.getch()
         if key == ord("q"):
             return
-        if key == ord("n"):
+        if key == curses.KEY_RIGHT:
             idx += 1
-        elif key == ord("b"):
+        elif key == curses.KEY_LEFT:
             idx = max(0, idx - 1)
         elif key in (ord(" "), 10, 13, curses.KEY_ENTER) and line["kind"] == "checkbox":
             line["checked"] = not line["checked"]
         elif key == ord("r") and is_runnable:
+            # subprocess.run() below blocks the whole UI thread for up to
+            # _run_shell_capture's timeout — paint a status first so a slow
+            # command reads as "running" instead of a dead/frozen screen.
+            try:
+                stdscr.addnstr(h - 1, 0,
+                               f" running: {cmd}  (up to 30s — UI is busy, please wait)"[:w - 1],
+                               max(0, w - 1), colors["teal"] | curses.A_BOLD)
+            except curses.error:
+                pass
+            stdscr.refresh()
             rc, output = _run_shell_capture(cmd)
+            # Anything typed while the UI was blocked above (e.g. impatient
+            # repeated "b"/"n" presses) is sitting in the terminal's input
+            # queue — without this it gets replayed into the output pane's
+            # own getch() and silently closes it, which reads as "the key
+            # doesn't work" once control returns to the walkthrough.
+            curses.flushinp()
             _show_output_pane(stdscr, curses, f"$ {cmd}   (exit {rc})", output, colors["teal"])
+            curses.flushinp()
         elif key == ord("o") and url:
             try:
                 webbrowser.open(url)
@@ -2955,7 +3058,7 @@ def run_interactive_report(md: str, export_path: str, deep: dict | None = None) 
                 except curses.error:
                     pass
 
-            footer = (" ↑/↓ or j/k move   space toggle   c copy   p AI prompt"
+            footer = (" ↑/↓ or j/k move   space toggle   c copy all   l copy line   p AI prompt"
                      f"   w walkthrough   e export   q quit   {status}")
             try:
                 stdscr.addnstr(h - 1, 0, footer[:w - 1], max(0, w - 1), teal_attr)
@@ -2976,10 +3079,17 @@ def run_interactive_report(md: str, export_path: str, deep: dict | None = None) 
                 if lines[cursor]["kind"] == "checkbox":
                     lines[cursor]["checked"] = not lines[cursor]["checked"]
             elif key == ord("c"):
-                text_to_copy = _copyable_text(_render_report_line(lines[cursor]))
-                status = (f"[copied: {text_to_copy[:40]}{'...' if len(text_to_copy) > 40 else ''}]"
+                text_to_copy = "\n".join(_render_report_line(l) for l in lines)
+                status = (f"[copied whole report — {len(lines)} lines]"
                          if copy_to_clipboard(text_to_copy)
-                         else "[no clipboard tool found — install xclip/xsel/wl-copy/pbcopy]")
+                         else "[copy failed — your terminal may not support OSC 52; "
+                              "use 'e' to export instead]")
+            elif key == ord("l"):
+                text_to_copy = _copyable_text(_render_report_line(lines[cursor]))
+                status = (f"[copied line: {text_to_copy[:40]}{'...' if len(text_to_copy) > 40 else ''}]"
+                         if copy_to_clipboard(text_to_copy)
+                         else "[copy failed — your terminal may not support OSC 52; "
+                              "use 'e' to export instead]")
             elif key == ord("p"):
                 prompt_text = synthesize_ai_prompt(lines, deep)
                 if copy_to_clipboard(prompt_text):
@@ -3262,6 +3372,60 @@ def run_regression_tests() -> bool:
           not _is_command_carrier(
               "- **Branch:** `peytonli/fix/ui-ux-fixes` → `peytonli/feat/ai-prompt-loop`",
               "text"))
+    check("_looks_like_a_command rejects comma-separated name listings",
+          not _looks_like_a_command("delete_project, prune_orphans"))
+    check("added_lines_from_patch keeps just the added lines",
+          added_lines_from_patch("--- a/f\n+++ b/f\n@@ -1 +1 @@\n-old line\n"
+                                 "+new line\n context") == "new line")
+
+    # Regression for the "walkthrough only shows npm test" bug: changed
+    # backend functions must reach the guided walkthrough. Rendered as plain
+    # sub-bullets they satisfied none of its step rules (checkbox / runnable
+    # command / URL) and were silently skipped even though the static report
+    # showed them — so the walkthrough fell through to the next real step.
+    _real_related = find_related_prs
+    globals()["find_related_prs"] = lambda *a, **k: []
+    try:
+        _md = render_markdown(
+            {"areas": {"Orchestrator": {
+                 "files": ["services/orchestrator/app/db_repos.py"],
+                 "additions": 10, "deletions": 2, "test_command": "pytest"}},
+             "risks": [], "total_files": 1, "total_additions": 10,
+             "total_deletions": 2, "tests_included": False,
+             "submodule_bumps": [], "rebuild_needed": False,
+             "frontend_touched": False, "backend_touched": True,
+             "frontend_paths": [],
+             "backend_paths": ["services/orchestrator/app/db_repos.py"],
+             "deep": {"available": True, "repo_path": "/tmp/x", "head_sha": "abc123",
+                      "files": [{"path": "services/orchestrator/app/db_repos.py",
+                                 "symbols": ["delete_project", "logger"],
+                                 "neighbors": [], "users": [], "tests": [],
+                                 "routes": [], "visual_checks": []},
+                                {"path": "services/orchestrator/tests/test_db_repos.py",
+                                 "symbols": ["TestDeleteProject", "test_delete_project"],
+                                 "neighbors": [], "users": [], "tests": [],
+                                 "routes": [], "visual_checks": []}]}},
+            {"title": "t", "number": 1,
+             "head": {"ref": "b"}, "base": {"ref": "main"}},
+            "org/repo")
+    finally:
+        globals()["find_related_prs"] = _real_related
+    _fn_steps = [l for l in _parse_report_lines(_md)
+                 if l["kind"] == "checkbox" and "delete_project" in l["raw"]
+                 and "db_repos.py" in l["raw"]]
+    check("changed backend functions become walkthrough steps (not skipped "
+         "like plain bullets were)",
+          len(_fn_steps) == 1 and _is_walkthrough_step(_fn_steps[0]))
+    check("a changed-function step is a checklist item, not a bogus "
+         "runnable command",
+          len(_fn_steps) == 1
+          and _walkthrough_step_kind(_fn_steps[0],
+                                     _render_report_line(_fn_steps[0])) == "checklist"
+          and not _is_command_carrier(_render_report_line(_fn_steps[0]), "checkbox"))
+    check("test-file symbols stay out of the manual per-function checklist "
+         "(deep scan may still list them informationally)",
+          not any(l["kind"] == "checkbox" and "test_db_repos" in l["raw"]
+                  for l in _parse_report_lines(_md)))
 
     print("-- live checks (network; skipped on failure, not failed) --", file=sys.stderr)
     try:
