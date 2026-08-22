@@ -2,6 +2,61 @@
 
 Shared Deepiri toolchain repository. Today it publishes the Node.js Docker base for Team Deepiri services: `curl`, `dumb-init`, `bash`, OpenSSL (Alpine), K8s env loader scripts, and a non-root `nodejs` user (uid/gid 1001).
 
+## PR QA Test Planner
+
+`scripts/pr-qa-planner.py` is the one script for Team-Deepiri PR QA work: it
+tells QA engineers what to test on any pull request, and separately checks
+that reviews actually report what was tested.
+
+No manual setup: on first run it auto-installs the `gh` CLI via your
+platform's package manager if it's missing, then runs `gh auth login` if
+you're not authenticated. Nothing else to install — stdlib only.
+
+**Test planning** — including submodule-bump PRs against the
+`deepiri-platform` monorepo:
+
+```bash
+# Local analysis
+python3 scripts/pr-qa-planner.py --repo Team-Deepiri/deepiri-platform --pr 316
+
+# Post the test plan as a comment on the PR (QA checks off the checklist)
+python3 scripts/pr-qa-planner.py --repo Team-Deepiri/deepiri-api-gateway --pr 42 --comment
+
+# Scan a local checkout to find exactly which tests exercise the changed code
+python3 scripts/pr-qa-planner.py --repo Team-Deepiri/deepiri-auth-service --pr 74 --deep
+
+# Machine-readable output for CI / other tooling
+python3 scripts/pr-qa-planner.py --repo Team-Deepiri/deepiri-platform --pr 316 --json
+```
+
+The plan follows the `deepiri-qa-workflow` skill: task identification
+(Plaky/inbox/cross-PR deps/submodule-bump commits), environment bring-up via
+the consolidated `setup-deepiri-dev.sh --team qa` script (adds `--build`
+automatically when the PR touches lockfiles/Dockerfiles/submodule pointers),
+health check + `/sorge` first pass, frontend/backend verification, and the
+review-submission rule (Approve or Request Changes, never Comment-only).
+
+**Review-quality enforcement** — checks that an Approve/Request-Changes
+review actually filled in the required test-report template (Environment,
+Health check, Sorge pass, Manual testing, Automated tests) instead of
+rubber-stamping with a bare "LGTM" or leaving the bracketed placeholders:
+
+```bash
+# Check one PR's latest final review
+python3 scripts/pr-qa-planner.py --review-check --repo Team-Deepiri/deepiri-auth-service --pr 74
+
+# Same, and post a nudge comment tagging the reviewer if it's incomplete
+python3 scripts/pr-qa-planner.py --review-check --repo Team-Deepiri/deepiri-auth-service --pr 74 --nudge
+
+# Compliance report across a repo's recent merged PRs, by reviewer
+python3 scripts/pr-qa-planner.py --review-check --sweep --repo Team-Deepiri/deepiri-auth-service --limit 30
+
+# Same, across every repo the QA team reviews
+python3 scripts/pr-qa-planner.py --review-check --sweep --all-repos --limit 30
+```
+
+See the module docstring for the full option list.
+
 Images are published to **GitHub Container Registry**:
 
 | Tag | Base | Typical services |
