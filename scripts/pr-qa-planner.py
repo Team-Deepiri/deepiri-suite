@@ -49,6 +49,9 @@ and auto-installs it via the platform's package manager if missing, then
 runs `gh auth login` if not authenticated. Stdlib only otherwise.
 """
 import argparse
+import base64
+import glob
+import http
 import itertools
 import json
 import os
@@ -57,8 +60,15 @@ import re
 import shutil
 import subprocess
 import sys
+import io
+import tarfile
+import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
+import webbrowser
+import zipfile
 from collections import defaultdict
 
 ORG = "Team-Deepiri"
@@ -198,42 +208,316 @@ def ensure_gh_ready(skip: bool = False) -> None:
                              "and re-run this script.")
 
 
-def _install_gh() -> bool:
-    """Best-effort install of the gh CLI via the current platform's package
-    manager. Falls back through managers in order until one works."""
-    system = platform.system()
+# ---------------------------------------------------------------------------
+# Better than guessing package managers: for a tool that publishes official
+# prebuilt binaries on GitHub Releases, download the right one directly —
+# no apt/dnf/pacman/brew/winget knowledge needed at all, works identically
+# on any OS/distro, no sudo required (installs into the user's own bin dir).
+# This is the primary install path; the package-manager table below is only
+# a fallback for when this can't run (offline, rate-limited, no matching
+# release asset).
+# ---------------------------------------------------------------------------
+
+def _os_arch_tags() -> tuple[list[str], list[str]]:
+    """Tokens likely to appear in a release asset name for this OS/CPU —
+    derived live from platform.system()/platform.machine(), not a fixed
+    per-tool table."""
+    system = platform.system().lower()
+    os_tags = {
+        "linux": ["linux"],
+        "darwin": ["darwin", "macos", "apple"],
+        "windows": ["windows", "win"],
+    }.get(system, [system])
+    machine = platform.machine().lower()
+    if machine in ("x86_64", "amd64"):
+        arch_tags = ["x86_64", "amd64", "x64"]
+    elif machine in ("arm64", "aarch64"):
+        arch_tags = ["arm64", "aarch64"]
+    else:
+        arch_tags = [machine]
+    return os_tags, arch_tags
+
+
+def _pick_release_asset(assets: list[dict]) -> dict | None:
+    os_tags, arch_tags = _os_arch_tags()
+    candidates = [a for a in assets
+                 if any(t in a["name"].lower() for t in os_tags)
+                 and any(t in a["name"].lower() for t in arch_tags)
+                 and a["name"].lower().endswith((".tar.gz", ".tgz", ".zip"))]
+    # musl/static builds are the safest bet on an unknown Linux distro
+    # (no glibc-version assumptions) — prefer them when present.
+    if platform.system().lower() == "linux":
+        musl = [a for a in candidates if "musl" in a["name"].lower()]
+        if musl:
+            return musl[0]
+    return candidates[0] if candidates else None
+
+
+def install_from_github_release(gh_repo: str, binary_name: str, dest_dir: str | None = None) -> bool:
+    """Fetch the latest release of `gh_repo` and install whichever binary
+    inside matches `binary_name` for this OS/arch. Uses urllib directly
+    (not the `gh` CLI) since this may be called to install `gh` itself."""
+    dest_dir = dest_dir or os.path.join(os.path.expanduser("~"), ".local", "bin")
     try:
-        if system == "Darwin" and shutil.which("brew"):
-            return subprocess.run(["brew", "install", "gh"]).returncode == 0
-        if system == "Linux":
-            if shutil.which("apt-get"):
-                if subprocess.run(["sudo", "apt-get", "install", "-y", "gh"]).returncode == 0:
-                    return True
-                # Not in the default repos on this release — add the official
-                # apt source (per https://cli.github.com/) and retry.
-                setup = (
-                    "curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg "
-                    "| sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg && "
-                    "sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg && "
-                    'echo "deb [arch=$(dpkg --print-architecture) '
-                    "signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] "
-                    'https://cli.github.com/packages stable main" | '
-                    "sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null && "
-                    "sudo apt-get update && sudo apt-get install -y gh"
-                )
-                return subprocess.run(["bash", "-c", setup]).returncode == 0
-            if shutil.which("dnf"):
-                return subprocess.run(["sudo", "dnf", "install", "-y", "gh"]).returncode == 0
-            if shutil.which("yum"):
-                return subprocess.run(["sudo", "yum", "install", "-y", "gh"]).returncode == 0
-            if shutil.which("pacman"):
-                return subprocess.run(["sudo", "pacman", "-S", "--noconfirm", "github-cli"]).returncode == 0
-            if shutil.which("snap"):
-                return subprocess.run(["sudo", "snap", "install", "gh"]).returncode == 0
-        if system == "Windows" and shutil.which("winget"):
-            return subprocess.run(["winget", "install", "--id", "GitHub.cli"]).returncode == 0
-    except (subprocess.CalledProcessError, OSError):
+        req = urllib.request.Request(
+            f"https://api.github.com/repos/{gh_repo}/releases/latest",
+            headers={"User-Agent": "pr-qa-planner", "Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            release = json.loads(resp.read().decode())
+    except (urllib.error.URLError, OSError, json.JSONDecodeError, TimeoutError):
         return False
+    asset = _pick_release_asset(release.get("assets", []))
+    if not asset:
+        return False
+    try:
+        req = urllib.request.Request(asset["browser_download_url"],
+                                     headers={"User-Agent": "pr-qa-planner"})
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            blob = resp.read()
+    except (urllib.error.URLError, OSError, TimeoutError):
+        return False
+
+    target_name = binary_name + (".exe" if platform.system() == "Windows" else "")
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            if asset["name"].endswith(".zip"):
+                with zipfile.ZipFile(io.BytesIO(blob)) as zf:
+                    zf.extractall(tmp)
+            else:
+                with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tf:
+                    tf.extractall(tmp)
+        except (zipfile.BadZipFile, tarfile.TarError, OSError):
+            return False
+        found = None
+        for dirpath, _dirs, filenames in os.walk(tmp):
+            if target_name in filenames:
+                found = os.path.join(dirpath, target_name)
+                break
+        if not found:
+            return False
+        os.makedirs(dest_dir, exist_ok=True)
+        dest_path = os.path.join(dest_dir, target_name)
+        try:
+            shutil.copy2(found, dest_path)
+            os.chmod(dest_path, 0o755)
+        except OSError:
+            return False
+    if dest_dir not in os.environ.get("PATH", "").split(os.pathsep):
+        print(f"[setup] installed to {dest_path} — add {dest_dir} to your PATH "
+              "if this isn't picked up automatically.", file=sys.stderr)
+    return shutil.which(target_name) is not None or os.path.isfile(dest_path)
+
+
+# One generic package-manager table shared by every auto-installer in this
+# script, instead of the same if/elif "apt-get, dnf, pacman, snap, brew,
+# winget" chain hand-copied per tool (and each copy only covering a subset).
+PACKAGE_MANAGERS: list[tuple[str, list[str]]] = [
+    ("brew", ["brew", "install", "{pkg}"]),
+    ("apt-get", ["sudo", "apt-get", "install", "-y", "{pkg}"]),
+    ("dnf", ["sudo", "dnf", "install", "-y", "{pkg}"]),
+    ("yum", ["sudo", "yum", "install", "-y", "{pkg}"]),
+    ("pacman", ["sudo", "pacman", "-S", "--noconfirm", "{pkg}"]),
+    ("zypper", ["sudo", "zypper", "install", "-y", "{pkg}"]),
+    ("apk", ["sudo", "apk", "add", "{pkg}"]),
+    ("snap", ["sudo", "snap", "install", "{pkg}"]),
+    ("winget", ["winget", "install", "--id", "{pkg}"]),
+    ("choco", ["choco", "install", "-y", "{pkg}"]),
+    ("scoop", ["scoop", "install", "{pkg}"]),
+]
+
+# Which family in /etc/os-release's ID/ID_LIKE maps to which entry in
+# PACKAGE_MANAGERS above.
+_DISTRO_FAMILY_MANAGER = {
+    "debian": "apt-get", "ubuntu": "apt-get",
+    "fedora": "dnf", "rhel": "dnf", "centos": "dnf", "rocky": "dnf", "alma": "dnf",
+    "arch": "pacman", "manjaro": "pacman",
+    "suse": "zypper", "opensuse": "zypper",
+    "alpine": "apk",
+}
+
+
+def read_os_release() -> dict[str, str]:
+    """/etc/os-release is the freedesktop.org-standardized file every
+    modern Linux distro uses to declare its own identity (ID/ID_LIKE).
+    Reading it tells you deterministically which one package manager this
+    system actually uses, instead of probing a list of binary names to see
+    which "might" be present — this is *where the answer already is*, not
+    a guess. WSL needs no special-casing: it runs a real distro with its
+    own /etc/os-release, so this applies there unchanged."""
+    info: dict[str, str] = {}
+    if not os.path.isfile("/etc/os-release"):
+        return info
+    try:
+        with open("/etc/os-release") as f:
+            for line in f:
+                if "=" in line:
+                    k, _, v = line.strip().partition("=")
+                    info[k] = v.strip('"').strip("'")
+    except OSError:
+        pass
+    return info
+
+
+# Each package manager writes its own database to a fixed, well-known path
+# the moment it's actually installed and used — checking for that database
+# is real evidence this machine uses it, not a guess about a binary name
+# that merely happens to be on PATH (which a random same-named script could
+# fake). Used as a cross-check against os-release, and as the fallback when
+# os-release is missing or unrecognized (minimal containers, BSDs, etc.).
+_PACKAGE_MANAGER_STATE_PATHS = {
+    "apt-get": ("/var/lib/dpkg/status",),
+    "dnf": ("/var/lib/rpm",),
+    "yum": ("/var/lib/rpm",),
+    "pacman": ("/var/lib/pacman/local",),
+    "zypper": ("/var/lib/zypp",),
+    "apk": ("/lib/apk/db/installed",),
+}
+
+
+def scan_for_package_manager_state() -> str | None:
+    """Which package manager's own database actually exists on this
+    device — real on-disk evidence, checked before ever probing a binary
+    name via PATH."""
+    for manager, paths in _PACKAGE_MANAGER_STATE_PATHS.items():
+        if any(os.path.exists(p) for p in paths):
+            return manager
+    return None
+
+
+def detect_native_package_manager() -> str | None:
+    """The one package manager this device actually has, found by
+    inspecting the device itself: first the state its package database
+    writes to disk the moment it's really installed (the strongest
+    evidence — can't be faked by an unrelated same-named script), then
+    falling back to the OS's own self-declared identity (os-release ID) if
+    no database is found yet (e.g. a from-scratch system where the
+    database hasn't been touched). macOS/Windows have no os-release or
+    dpkg/rpm-style database — the OS itself is the declaration there
+    (Homebrew is the macOS convention; winget ships with modern Windows)."""
+    system = platform.system()
+    if system == "Darwin":
+        return "brew"
+    if system == "Windows":
+        return "winget"
+    from_state = scan_for_package_manager_state()
+    if from_state:
+        return from_state
+    info = read_os_release()
+    ident = f"{info.get('ID', '')} {info.get('ID_LIKE', '')}".lower()
+    for family, manager in _DISTRO_FAMILY_MANAGER.items():
+        if family in ident:
+            return manager
+    return None
+
+
+def repology_repo_hint() -> str | None:
+    """A substring to match against repology.org repo names for THIS
+    specific machine — derived from where the machine already declares its
+    own identity (the same os-release ID read_os_release() uses, e.g.
+    "ubuntu"/"fedora"/"arch", which is a literal substring of repology's
+    repo slugs like "ubuntu_24_04"/"fedora_40"/"arch"), not a hand-authored
+    manager -> repo-prefix mapping. macOS/Windows have no os-release, but
+    the OS itself is the declaration there — repology's repo for each is
+    just named "homebrew"/"winget"."""
+    system = platform.system()
+    if system == "Darwin":
+        return "homebrew"
+    if system == "Windows":
+        return "winget"
+    return (read_os_release().get("ID") or "").lower() or None
+
+
+def resolve_package_name_for_this_machine(repology_project: str, fallback: str) -> str:
+    """What `repology_project` is actually called in the ONE package repo
+    this specific machine uses, per repology.org's public API (a live
+    aggregator that already tracks package names across every major
+    repository) — instead of hand-typing manager-specific name variants
+    (pacman calls gh "github-cli", apt just calls it "gh", etc.). Only ever
+    resolves for the machine's own repo, not every manager pre-emptively,
+    so there's no per-manager table to maintain. Falls back to
+    `fallback` (the project's own plain name) if repology is unreachable
+    or has no entry for this machine's repo."""
+    hint = repology_repo_hint()
+    if not hint:
+        return fallback
+    try:
+        req = urllib.request.Request(
+            f"https://repology.org/api/v1/project/{repology_project}",
+            headers={"User-Agent": "pr-qa-planner (github.com/Team-Deepiri/deepiri-suite)"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            entries = json.loads(resp.read().decode())
+    except (urllib.error.URLError, OSError, json.JSONDecodeError, TimeoutError):
+        return fallback
+    for entry in entries:
+        if hint in entry.get("repo", "").lower():
+            # binnames is the actually-installable package name; srcname is
+            # the source package, which can differ (Debian's source package
+            # for ripgrep is "rust-ripgrep" but you `apt install ripgrep`,
+            # the binary package name) — prefer binnames.
+            binnames = entry.get("binnames") or []
+            name = (binnames[0] if binnames else None) or \
+                entry.get("srcname") or entry.get("visiblename")
+            if name:
+                return name
+    return fallback
+
+
+def install_via_package_manager(pkg_names: dict[str, str], timeout: int = 180) -> bool:
+    """Try this OS's own declared native package manager first (read from
+    where its identity actually lives — /etc/os-release, or the OS itself
+    on macOS/Windows), then fall back to probing every other manager in
+    PACKAGE_MANAGERS for the rare case the native one isn't confirmed
+    present (containers missing os-release, an atypical install, etc.).
+    `pkg_names` maps manager-binary -> the package name for that manager
+    (names sometimes differ, e.g. "ripgrep" vs winget's
+    "BurntSushi.ripgrep.MSVC") — a manager not present in `pkg_names` is
+    skipped even if it's installed."""
+    native = detect_native_package_manager()
+    order = PACKAGE_MANAGERS
+    if native:
+        order = [pm for pm in PACKAGE_MANAGERS if pm[0] == native] + \
+                [pm for pm in PACKAGE_MANAGERS if pm[0] != native]
+    for binary, template in order:
+        pkg = pkg_names.get(binary)
+        if not pkg or not shutil.which(binary):
+            continue
+        cmd = [part.format(pkg=pkg) for part in template]
+        try:
+            if subprocess.run(cmd, timeout=timeout).returncode == 0:
+                return True
+        except (subprocess.TimeoutExpired, OSError):
+            continue
+    return False
+
+
+def _install_gh() -> bool:
+    """Install the gh CLI. Tries the official prebuilt binary release first
+    (no package-manager guessing needed at all), then falls back to
+    whichever package manager this machine actually has, using the package
+    name repology.org reports for THIS machine's own repo (falling back to
+    the bare project name "gh" only if that lookup is unreachable)."""
+    if install_from_github_release("cli/cli", "gh"):
+        return True
+    pkg_name = resolve_package_name_for_this_machine("github-cli", "gh")
+    if install_via_package_manager({m: pkg_name for m, _ in PACKAGE_MANAGERS}):
+        return True
+    # apt's default repos don't carry `gh` on some releases — add the
+    # official apt source (per https://cli.github.com/) and retry.
+    if shutil.which("apt-get"):
+        setup = (
+            "curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg "
+            "| sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg && "
+            "sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg && "
+            'echo "deb [arch=$(dpkg --print-architecture) '
+            "signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] "
+            'https://cli.github.com/packages stable main" | '
+            "sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null && "
+            "sudo apt-get update && sudo apt-get install -y gh"
+        )
+        try:
+            return subprocess.run(["bash", "-c", setup], timeout=180).returncode == 0
+        except (subprocess.TimeoutExpired, OSError):
+            return False
     return False
 
 
@@ -419,8 +703,13 @@ def build_service_map_from_dtm(platform_root: str) -> list[tuple[str, str, str]]
     of the local platform checkout. Returns None if dtm isn't usable here."""
     if not ensure_dtm_ready():
         return None
-    r = subprocess.run(["dtm", "scan", "--path", platform_root],
-                       capture_output=True, text=True, timeout=120)
+    try:
+        r = subprocess.run(["dtm", "scan", "--path", platform_root],
+                           capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        print("[warn] dtm scan timed out after 120s — falling back to .gitmodules",
+              file=sys.stderr)
+        return None
     if r.returncode != 0:
         print(f"[warn] dtm scan failed: {r.stderr.strip()}", file=sys.stderr)
         return None
@@ -446,11 +735,10 @@ def build_service_map_from_dtm(platform_root: str) -> list[tuple[str, str, str]]
     return entries or None
 
 
-def fetch_gitmodules_text(org: str) -> str | None:
-    """Fetch deepiri-platform's .gitmodules via the GitHub API — works with
-    no local checkout, still a live read instead of a hardcoded list."""
-    r = gh("api", f"repos/{org}/deepiri-platform/contents/.gitmodules",
-           "--jq", ".content")
+def fetch_gitmodules_text(repo: str) -> str | None:
+    """Fetch a repo's own .gitmodules via the GitHub API — works with no
+    local checkout, still a live read instead of a hardcoded list."""
+    r = gh("api", f"repos/{repo}/contents/.gitmodules", "--jq", ".content")
     if r.returncode != 0 or not r.stdout.strip():
         return None
     import base64
@@ -472,11 +760,122 @@ def guess_test_command_via_language(repo: str) -> str:
     return "manual"
 
 
-def build_service_map_from_gitmodules(org: str) -> list[tuple[str, str, str]]:
-    """Fallback when dtm isn't available/installable: parse .gitmodules for
-    path->repo, then guess the test command from the repo's GitHub language.
-    Still fully dynamic — no per-repo list to maintain by hand."""
-    text = fetch_gitmodules_text(org)
+_LINGUIST_MAP: dict[str, str] | None = None
+
+# GitHub's own language-classifier data source — the exact list GitHub uses
+# to compute a repo's "Language" stats and green bar. Fetched once and
+# cached instead of hand-typing "which extensions count as JS-like" — the
+# authoritative external source, same idea as sourcing HTTP_METHODS from
+# Python's own http.HTTPMethod enum rather than typing HTTP verbs by hand.
+LINGUIST_LANGUAGES_URL = ("https://raw.githubusercontent.com/github-linguist/"
+                         "linguist/main/lib/linguist/languages.yml")
+
+
+def fetch_linguist_extension_map() -> dict[str, str]:
+    """extension -> language name (e.g. ".ts" -> "TypeScript"), parsed out
+    of Linguist's languages.yml with a tiny stdlib-only scan (no PyYAML
+    dependency) — we only need top-level "LanguageName:" blocks and their
+    "type:"/"extensions:" entries, not the full YAML grammar.
+
+    Some extensions are genuinely ambiguous in Linguist's own data — ".ts"
+    is claimed by both TypeScript (type: programming) and XML (type: data;
+    an old MPEG/translation-file convention) — so only `type: programming`
+    languages are kept here, since that's what determines test tooling;
+    a data/markup/prose format claiming the same extension is irrelevant
+    for "what test command applies"."""
+    global _LINGUIST_MAP
+    if _LINGUIST_MAP is not None:
+        return _LINGUIST_MAP
+    try:
+        req = urllib.request.Request(LINGUIST_LANGUAGES_URL,
+                                     headers={"User-Agent": "pr-qa-planner"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            text = resp.read().decode("utf-8", errors="replace")
+    except (urllib.error.URLError, OSError, TimeoutError):
+        _LINGUIST_MAP = {}
+        return _LINGUIST_MAP
+    mapping: dict[str, str] = {}
+    current_lang = None
+    current_is_programming = False
+    for line in text.splitlines():
+        top_level = re.match(r'^([A-Za-z][^:]*|"[^"]+"):\s*$', line)
+        if top_level:
+            current_lang = top_level.group(1).strip('"')
+            current_is_programming = False
+            continue
+        type_line = re.match(r"^\s+type:\s*(\S+)\s*$", line)
+        if type_line:
+            current_is_programming = type_line.group(1) == "programming"
+            continue
+        if not current_is_programming:
+            continue
+            continue
+        ext_line = re.match(r'^\s+-\s*"?(\.[^"\s]+)"?\s*$', line)
+        if ext_line and current_lang:
+            mapping[ext_line.group(1).lower()] = current_lang
+    _LINGUIST_MAP = mapping
+    return mapping
+
+
+def detect_primary_language(paths: list[str]) -> str | None:
+    """The most common language among the PR's own changed files, per
+    Linguist's extension map — not a repo-wide language field (which
+    reflects total bytes across the whole repo, misleading for a mixed-
+    language repo where this PR only touches one side of it)."""
+    ext_map = fetch_linguist_extension_map()
+    if not ext_map:
+        return None
+    langs = [ext_map[os.path.splitext(p)[1].lower()] for p in paths
+            if os.path.splitext(p)[1].lower() in ext_map]
+    if not langs:
+        return None
+    return max(set(langs), key=langs.count)
+
+
+# The only genuinely hand-authored mapping left: which *test tool* a
+# language's ecosystem conventionally uses. This is tooling convention, not
+# a fact derivable from a language-classification source — there's no
+# external authority for "how do TypeScript projects usually run tests"
+# the way Linguist is one for "which extension is which language".
+TEST_COMMAND_BY_LANGUAGE = {
+    "JavaScript": "npm test", "TypeScript": "npm test",
+    "TSX": "npm test", "JSX": "npm test",
+    "Python": "pytest",
+    "Go": "go test ./...",
+}
+
+
+def guess_test_command_from_changed_paths(paths: list[str], repo: str | None = None,
+                                          ref: str | None = None) -> str:
+    """The real test command, read from the repo's own config when possible
+    — package.json's actual `scripts.test` (the same signal
+    detect_js_test_runner uses locally, fetched remotely here since this
+    path runs when there's no local checkout) — falling back to the
+    language Linguist detects among the PR's own changed files (see
+    detect_primary_language) only when that config can't be read."""
+    lang = detect_primary_language(paths)
+    if repo and ref and TEST_COMMAND_BY_LANGUAGE.get(lang) == "npm test":
+        pkg = fetch_repo_file_remote(repo, ref, "package.json")
+        if pkg:
+            try:
+                test_script = (json.loads(pkg).get("scripts", {}) or {}).get("test")
+            except json.JSONDecodeError:
+                test_script = None
+            # package.json exists and we can see whether it declares a real
+            # test script — trust that over guessing, in both directions.
+            return "npm test" if test_script else "manual"
+    return TEST_COMMAND_BY_LANGUAGE.get(lang, "manual")
+
+
+def build_service_map_from_gitmodules(repo: str) -> list[tuple[str, str, str]]:
+    """Fallback when dtm isn't available/installable: parse the analyzed
+    repo's own .gitmodules for path->repo, then guess the test command from
+    each submodule's GitHub language. Still fully dynamic — no per-repo
+    list to maintain by hand, and no assumption about which repo in the org
+    is "the monorepo": whichever repo is being analyzed either has its own
+    .gitmodules (and this returns real entries) or it doesn't (empty list,
+    and analyze() treats it as a standalone repo)."""
+    text = fetch_gitmodules_text(repo)
     if not text:
         return []
     entries = []
@@ -490,21 +889,29 @@ def build_service_map_from_gitmodules(org: str) -> list[tuple[str, str, str]]:
         label = prettify_service_name(short)
         if path.startswith("platform-services/shared/"):
             label += " (shared)"
-        cmd = guess_test_command_via_language(f"{org}/{short}")
+        # Submodules live in the same org as their parent monorepo — no need
+        # to parse the org out of the .gitmodules URL (SSH-style
+        # git@host:org/repo.git doesn't split cleanly on "/" anyway).
+        cmd = guess_test_command_via_language(f"{repo.split('/')[0]}/{short}")
         entries.append((path, label, f"cd {path} && {cmd}"))
     return entries
 
 
-def build_service_map(org: str) -> list[tuple[str, str, str]]:
+def build_service_map(repo: str, org: str) -> list[tuple[str, str, str]]:
     """The live path->(area, test command) map used by classify_path, built
-    fresh each run instead of hand-maintained. Tries dtm first (precise),
-    falls back to .gitmodules + language guess (works anywhere)."""
-    platform_root = repo_root_hint(f"{org}/deepiri-platform")
-    if platform_root:
-        from_dtm = build_service_map_from_dtm(platform_root)
+    fresh each run from the repo actually being analyzed — not a fixed
+    "the monorepo is always named X" assumption. Tries a local dtm scan of
+    that repo first (precise), falls back to that repo's own .gitmodules
+    (works anywhere, no local checkout needed). Both naturally return an
+    empty list for a repo with no submodule structure of its own — analyze()
+    treats that as "this PR's whole repo is its own area" rather than trying
+    to force a path-prefix match that can't exist."""
+    local_root = repo_root_hint(repo)
+    if local_root:
+        from_dtm = build_service_map_from_dtm(local_root)
         if from_dtm:
             return from_dtm
-    return build_service_map_from_gitmodules(org)
+    return build_service_map_from_gitmodules(repo)
 
 # Risk-signal keyword -> (flag, QA guidance)
 RISK_RULES = [
@@ -590,6 +997,7 @@ def is_gitlink_change(f: dict) -> bool:
 
 
 SUBPROJECT_SHA_RE = re.compile(r"^\+Subproject commit ([0-9a-f]{40})", re.MULTILINE)
+OLD_SUBPROJECT_SHA_RE = re.compile(r"^-Subproject commit ([0-9a-f]{40})", re.MULTILINE)
 
 # Cross-repo refs like "Team-Deepiri/deepiri-web-frontend#123" — unambiguous,
 # no keyword needed.
@@ -689,6 +1097,7 @@ def find_related_prs(repo: str, head_ref: str, exclude_number: int = 0) -> list[
 
 
 def analyze(files: list[dict], service_map: list[tuple[str, str, str]],
+            repo: str | None = None, ref: str | None = None,
             changed_files_before: int = 0) -> dict:
     """Build the plan model from the PR's changed files."""
     areas: dict[str, dict] = defaultdict(
@@ -702,8 +1111,24 @@ def analyze(files: list[dict], service_map: list[tuple[str, str, str]],
         any(t in p for t in REBUILD_TRIGGERS) for p in low_paths
     ) or bool(submodule_bumps)
 
+    # service_map is now built from the analyzed repo's OWN submodule
+    # structure (see build_service_map): it's non-empty exactly when this
+    # repo has submodules of its own (a monorepo, whatever it's named), and
+    # empty when it doesn't (a standalone repo, whose paths are repo-
+    # relative like "src/App.tsx" and could never match a path prefix
+    # anyway). So "no service_map at all" — not a hardcoded repo name — is
+    # the correct, fully dynamic signal to treat the whole repo as one area
+    # instead of dumping everything into "(unknown / other)".
+    whole_repo_label, whole_repo_cmd = None, None
+    if repo and not service_map:
+        short = repo.split("/")[-1]
+        whole_repo_label = prettify_service_name(short)
+        whole_repo_cmd = guess_test_command_from_changed_paths(all_paths, repo, ref)
+
     for f in files:
         label, cmd = classify_path(f["filename"], service_map)
+        if not label and whole_repo_label:
+            label, cmd = whole_repo_label, whole_repo_cmd
         area = areas[label] if label else areas["(unknown / other)"]
         area["files"].append(f["filename"])
         area["additions"] += f.get("additions", 0)
@@ -751,6 +1176,10 @@ def analyze(files: list[dict], service_map: list[tuple[str, str, str]],
         "rebuild_needed": rebuild_needed,
         "frontend_touched": any("web-frontend" in p or "frontend" in p for p in low_paths),
         "backend_touched": any("platform-services/backend" in p or "backend" in p for p in low_paths),
+        "frontend_paths": sorted(f for f, low in zip(all_paths, low_paths)
+                                 if "web-frontend" in low or "frontend" in low),
+        "backend_paths": sorted(f for f, low in zip(all_paths, low_paths)
+                                if "platform-services/backend" in low or "backend" in low),
     }
 
 
@@ -830,8 +1259,6 @@ def render_markdown(plan: dict, pr: dict, repo: str) -> str:
                  f"`bash setup-deepiri-dev.sh --team qa "
                  f"{'--build ' if plan['rebuild_needed'] else ''}[--tier 1|2|3]` — "
                  f"**{('rebuild required (lockfile/Dockerfile/submodule changes - add `--build` so stale images are not reused)') if plan['rebuild_needed'] else 'no rebuild needed, omit `--build`'}**")
-    lines.append("- Tear down when done: `docker compose -f docker-compose.dev.yml down` "
-                 "— don't leave stacks running between PRs.")
     lines.append("")
 
     # Phase 3 — Verification and testing
@@ -842,13 +1269,63 @@ def render_markdown(plan: dict, pr: dict, repo: str) -> str:
                  "still initializing produces false PR failures.")
     lines.append("- [ ] **Sorge bot pass:** comment `/sorge` on the PR; treat it as a "
                  "first pass that informs (not replaces) manual review.")
-    if plan["frontend_touched"]:
+    deep = plan.get("deep")
+    deep_files = deep.get("files", []) if deep and deep.get("available") else []
+    route_files = [cf for cf in deep_files if cf.get("routes")]
+    visual_files = [cf for cf in deep_files if cf.get("visual_checks")]
+    # A .py file is backend by language regardless of what its path happens
+    # to contain — the plain "backend" in p substring check below is a false
+    # positive on a *frontend* file like backendApi.ts (an API client, not a
+    # backend service) and a false negative on a real backend file with
+    # neither "backend" nor "frontend" anywhere in its path (e.g.
+    # services/orchestrator/app/db_repos.py). Symbol-bearing .py files
+    # without a detected route (a plain function like `delete_project`, not
+    # behind an HTTP decorator) still need their own specific callout below,
+    # not silence just because there's no route to build a curl command for.
+    route_file_paths = {cf["path"] for cf in route_files}
+    backend_symbol_files = [cf for cf in deep_files
+                            if cf["path"].endswith(".py") and cf["path"] not in route_file_paths
+                            and not TEST_FILE_PATH_RE.search(cf["path"])
+                            and any(s not in GENERIC_SYMBOLS for s in cf.get("symbols", []))]
+    frontend_touched = plan["frontend_touched"] or bool(visual_files)
+    backend_touched = plan["backend_touched"] or bool(route_files) or bool(backend_symbol_files)
+
+    if frontend_touched:
         lines.append("- [ ] **Frontend:** verify UI/UX against the design spec, not "
                      "just that the page loads.")
-    if plan["backend_touched"]:
+        if plan.get("frontend_paths"):
+            preview = ", ".join(f"`{p}`" for p in plan["frontend_paths"][:8])
+            if len(plan["frontend_paths"]) > 8:
+                preview += f", … +{len(plan['frontend_paths']) - 8} more"
+            lines.append(f"  - Frontend files changed: {preview}")
+    if backend_touched:
         lines.append("- [ ] **Backend:** verify functional requirements and data "
                      "integrity — what the change actually persists or returns, not "
                      "just that the endpoint responds.")
+        if route_files:
+            lines.append("  - Specific endpoints changed in this PR — test these directly:")
+            for cf in route_files:
+                for method, route_path, curl_cmd in cf["routes"]:
+                    lines.append(f"    - `{method} {route_path}` (changed in `{cf['path']}`): `{curl_cmd}`")
+        if backend_symbol_files:
+            lines.append("  - Specific functions changed in this PR — verify what each "
+                         "one actually persists/returns, not just that it runs without "
+                         "throwing:")
+            # One checkbox per file, not plain sub-bullets: the guided
+            # walkthrough only gives a line its own step when it's a
+            # checkbox, carries a runnable command, or has a URL — a plain
+            # bullet whose only code spans are a symbol name and a file
+            # path satisfies none of those and was silently skipped, so the
+            # static report showed these verifications but the walkthrough
+            # jumped straight past them to the next npm test.
+            for cf in backend_symbol_files:
+                named = ", ".join(s for s in cf["symbols"] if s not in GENERIC_SYMBOLS)
+                lines.append(f"    - [ ] `{named}` (changed in `{cf['path']}`)")
+        if not route_files and not backend_symbol_files and plan.get("backend_paths"):
+            preview = ", ".join(f"`{p}`" for p in plan["backend_paths"][:8])
+            if len(plan["backend_paths"]) > 8:
+                preview += f", … +{len(plan['backend_paths']) - 8} more"
+            lines.append(f"  - Backend files changed: {preview}")
     lines.append("")
     lines.append("#### Areas affected")
     lines.append("")
@@ -880,7 +1357,16 @@ def render_markdown(plan: dict, pr: dict, repo: str) -> str:
 
     lines.append("#### Manual QA checklist")
     lines.append("")
-    lines.append("- [ ] Run the per-area test commands above")
+    # One concrete, runnable checkbox per area instead of a vague "run the
+    # commands above" pointer at a markdown table — table rows ("| ... |")
+    # never register as walkthrough steps (only checkbox/bulleted lines with
+    # an embedded backtick command do), so that pointer was never actually
+    # actionable inside the guided walkthrough. Each area's own real test
+    # command (from plan["areas"], the same live data the table above uses)
+    # is embedded directly so `r` can run it.
+    for label, area in sorted(plan["areas"].items()):
+        cmd = (area.get("test_command") or "manual").replace("|", "\\|")
+        lines.append(f"- [ ] **{label}:** `{cmd}`")
     lines.append("- [ ] Smoke-test the primary user flows touched by this change")
     lines.append("- [ ] Check for regressions in adjacent services (shared-lib changes ripple)")
     lines.append("- [ ] Confirm no secrets/credentials were introduced")
@@ -926,6 +1412,17 @@ def render_markdown(plan: dict, pr: dict, repo: str) -> str:
         for f in all_changed:
             lines.append(f"- `{f}`")
         lines.append("</details>")
+        lines.append("")
+
+    # Wrap-up — last step, not a Phase 2 setup note, so the guided
+    # walkthrough presents it after everything else instead of right after
+    # the environment stands up.
+    lines.append("### When you're done")
+    lines.append("")
+    lines.append("- Tear down: `docker compose -f docker-compose.dev.yml down` "
+                 "— don't leave stacks running between PRs.")
+    
+    return "\n".join(lines)
     return "\n".join(lines)
 
 
@@ -941,21 +1438,46 @@ def render_markdown(plan: dict, pr: dict, repo: str) -> str:
 #      any test files that exercise it. Depth is bounded to changed files +
 #      one import hop + one rg hop (who references the symbols).
 
+# The HTTP verbs this script knows how to spot in route decorators/calls —
+# sourced from Python's own stdlib http.HTTPMethod enum (the language's
+# canonical definition of what an HTTP method is) rather than typed out by
+# hand, and defined once here instead of copy-pasted into four regexes.
+# CONNECT/TRACE are excluded — no web framework registers routes for them.
+HTTP_METHODS = tuple(m.value.lower() for m in http.HTTPMethod
+                     if m not in (http.HTTPMethod.CONNECT, http.HTTPMethod.TRACE))
+_METHOD_ALT = "|".join(HTTP_METHODS)
+
 PY_SYMBOL = re.compile(
     r"^(?:async\s+def|def)\s+(\w+)"
     r"|^class\s+(\w+)"
-    r"|@\w+\.(?:get|post|put|delete|patch)\([\"']([^\"']*)",
+    rf"|@\w+\.(?:{_METHOD_ALT})\(\s*[\"']([^\"']*)",
     re.MULTILINE,
 )
+# Order matters: the more specific function/class alternatives must come
+# before the bare "export default <name>" fallback, or `export default
+# function Home()` gets misread as a symbol literally named "function" (the
+# generic alt's \w+ greedily grabs the "function" keyword itself).
 TS_SYMBOL = re.compile(
-    r"^(?:export\s+)?(?:async\s+)?function\s+(\w+)"
+    r"^(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+(\w+)"
+    r"|^(?:export\s+)?(?:default\s+)?class\s+(\w+)"
     r"|^(?:export\s+)?const\s+(\w+)\s*="
-    r"|^export\s+default\s+(\w+)"
-    r"|\.(?:get|post|put|delete|patch)\([\"']([^\"']*)"
-    r"|^(?:export\s+)?class\s+(\w+)",
+    r"|^export\s+default\s+(\w+)\b"
+    rf"|\.(?:{_METHOD_ALT})\(\s*[\"']([^\"']*)",
     re.MULTILINE,
 )
 IMPORT_RE = re.compile(r"(?:from\s+|require\(|import\s*\(?)[\"']([^\"']+)[\"']")
+
+# Route decorators/calls with method captured separately from the symbol
+# regexes above — needed to generate a real curl command per route instead
+# of just listing "a route changed".
+PY_ROUTE = re.compile(rf"@\w+\.({_METHOD_ALT})\(\s*[\"']([^\"']*)",
+                     re.MULTILINE | re.IGNORECASE)
+TS_ROUTE = re.compile(rf"\.({_METHOD_ALT})\(\s*[\"']([^\"']*)",
+                     re.MULTILINE | re.IGNORECASE)
+
+# A file counts as "frontend" for visual-observation purposes by its own
+# extension/path shape, not by which repo it's in.
+FRONTEND_PATH_HINTS = (".tsx", ".jsx", "/components/", "/pages/", "/views/", "/screens/")
 
 
 # Symbols too generic to be worth a reverse-reference hop (they'd match half
@@ -963,6 +1485,24 @@ IMPORT_RE = re.compile(r"(?:from\s+|require\(|import\s*\(?)[\"']([^\"']+)[\"']")
 GENERIC_SYMBOLS = {"logger", "log", "prisma", "redis", "router", "app",
                    "server", "db", "client", "config", "utils", "helper",
                    "index", "request", "response", "req", "res", "express"}
+
+# Test files (pytest/unittest conventions) — their symbols are verified by
+# running them, which the plan already covers via each area's test command
+# and the deep scan's "Tests that exercise it" section. Listing every test
+# class/function as a hand-verification checkbox buried the real manual-QA
+# items under dozens of rows no human acts on one by one.
+TEST_FILE_PATH_RE = re.compile(
+    r"(^|/)(tests?|__tests__|specs?)/|(^|/)conftest\.py$"
+    r"|(^|/)test_[^/]*\.py$|_test\.py$")
+
+
+def added_lines_from_patch(patch: str) -> str:
+    """Just the added lines of a unified diff, "+" stripped — so symbol/route
+    extraction reflects what this PR actually changed, not everything that
+    happens to be defined in the whole file (a one-line tweak to a 40-export
+    API client file would otherwise list all 40 exports as "changed")."""
+    return "\n".join(line[1:] for line in patch.splitlines()
+                     if line.startswith("+") and not line.startswith("+++"))
 
 
 def extract_symbols(content: str, path: str) -> list[str]:
@@ -978,24 +1518,246 @@ def extract_imports(content: str) -> list[str]:
     return IMPORT_RE.findall(content)
 
 
+def extract_routes(content: str, path: str) -> list[tuple[str, str]]:
+    """(method, route_path) pairs actually defined in this file — real data
+    from the diff, not a guess — so a curl command can be generated per one."""
+    regex = PY_ROUTE if path.endswith(".py") else TS_ROUTE
+    return sorted(set((m.upper(), p) for m, p in regex.findall(content)))
+
+
+def is_frontend_path(path: str) -> bool:
+    low = path.lower()
+    return any(hint in low for hint in FRONTEND_PATH_HINTS)
+
+
+def find_compose_files(directory: str) -> list[str]:
+    """Docker Compose files in a directory, discovered by Compose's own
+    naming convention (`*compose*.y*ml` — covers docker-compose.yml,
+    docker-compose.dev.yml, compose.yaml, compose.override.yml, etc.)
+    instead of a fixed hardcoded filename list. A "dev" file sorts first
+    since that's the one local QA actually runs against."""
+    matches = [p for p in glob.glob(os.path.join(directory, "*compose*.y*ml"))
+              if os.path.isfile(p)]
+    matches.sort(key=lambda p: (0 if "dev" in os.path.basename(p).lower() else 1,
+                                len(os.path.basename(p))))
+    return matches
+
+
+def find_compose_root() -> str | None:
+    """Find a local checkout with docker-compose files, without assuming
+    which repo it is by name — starts from the current git top-level and
+    walks UP through ancestor directories (this script is commonly run from
+    inside a nested submodule, e.g. deepiri-suite/, whose own git top-level
+    is itself, not the platform monorepo a few levels up)."""
+    try:
+        top = subprocess.run(["git", "rev-parse", "--show-toplevel"],
+                             capture_output=True, text=True, check=True).stdout.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    candidates = [top]
+    parent = os.path.dirname(top)
+    for _ in range(6):
+        if not parent or parent == os.path.dirname(parent):
+            break
+        candidates.append(parent)
+        parent = os.path.dirname(parent)
+    for c in candidates:
+        if find_compose_files(c):
+            return c
+    return None
+
+
+def find_service_info(compose_root: str, short_repo: str) -> dict | None:
+    """Read a service's real port, container name, and compose service key
+    straight out of the platform's own docker-compose files — no hardcoded
+    port/container table. Matches on `container_name`, which this platform's
+    compose files consistently set to `<repo-short-name>-dev`."""
+    for compose_path in find_compose_files(compose_root):
+        fname = os.path.basename(compose_path)
+        try:
+            with open(compose_path) as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        m = (re.search(rf"container_name:\s*({re.escape(short_repo)}-dev)\b", text)
+             or re.search(rf"container_name:\s*({re.escape(short_repo)})\b", text))
+        if not m:
+            continue
+        container_name = m.group(1)
+        before = text[:m.start()]
+        key_matches = list(re.finditer(r"\n {2}([\w-]+):\n", before))
+        service_key = key_matches[-1].group(1) if key_matches else short_repo
+        rest = text[m.end():]
+        next_service = re.search(r"\n {2}\S[^\n]*:\n", rest)
+        block = rest[:next_service.start()] if next_service else rest
+        port_m = re.search(r'-\s*"?(\d+):(\d+)"?', block)
+        return {
+            "service_key": service_key,
+            "container_name": container_name,
+            "port": port_m.group(1) if port_m else None,
+            "compose_file": fname,
+        }
+    return None
+
+
+_CONTAINER_ENGINE: str | None = None
+_COMPOSE_CMD: str | None = None
+
+
+# Every container engine writes its own storage/socket state to disk the
+# moment it's actually installed and used — real evidence, not a name
+# probe (a random script named "docker" on PATH can't fake having written
+# Docker's actual storage directory).
+_CONTAINER_ENGINE_STATE_PATHS = {
+    "docker": ("/var/run/docker.sock", "/var/lib/docker",
+              os.path.join(os.path.expanduser("~"), ".docker")),
+    "podman": (os.path.join(os.path.expanduser("~"), ".local/share/containers/storage"),
+              "/var/lib/containers/storage",
+              "/run/podman/podman.sock"),
+    "nerdctl": ("/run/containerd/containerd.sock",),
+    "finch": (os.path.join(os.path.expanduser("~"), ".finch"),),
+}
+
+# What "search the device" falls back to naming when no state evidence
+# exists yet (a freshly installed engine that's never been run) — every
+# container CLI that actually exists in the wild today.
+KNOWN_CONTAINER_ENGINES = ("docker", "podman", "nerdctl", "finch")
+
+
+def scan_for_container_engine_state() -> str | None:
+    """Which container engine actually has real on-disk state on this
+    device — checked before ever probing a binary name via PATH."""
+    for engine, paths in _CONTAINER_ENGINE_STATE_PATHS.items():
+        if any(os.path.exists(p) for p in paths):
+            return engine
+    return None
+
+
+def detect_container_engine() -> str:
+    """Find the container engine this device actually uses: first by its
+    real on-disk state (storage directory, socket — evidence it's actually
+    installed and used), then by falling back to a PATH name check for a
+    freshly-installed engine with no state yet. No config, no assumption
+    that Docker is the only option."""
+    global _CONTAINER_ENGINE
+    if _CONTAINER_ENGINE is not None:
+        return _CONTAINER_ENGINE
+    from_state = scan_for_container_engine_state()
+    if from_state:
+        _CONTAINER_ENGINE = from_state
+        return _CONTAINER_ENGINE
+    for engine in KNOWN_CONTAINER_ENGINES:
+        if shutil.which(engine):
+            _CONTAINER_ENGINE = engine
+            return _CONTAINER_ENGINE
+    _CONTAINER_ENGINE = "docker"  # none present — most common default guess
+    return _CONTAINER_ENGINE
+
+
+def detect_compose_command() -> str:
+    """Compose ships multiple incompatible invocations depending on engine
+    and install: the v2 plugin ('docker compose'/'podman compose', space)
+    or a legacy standalone binary ('docker-compose'/'podman-compose',
+    hyphen). Detect which this machine actually has instead of assuming
+    one — and detect it for whichever engine is actually present."""
+    global _COMPOSE_CMD
+    if _COMPOSE_CMD is not None:
+        return _COMPOSE_CMD
+    engine = detect_container_engine()
+    if shutil.which(engine):
+        try:
+            r = subprocess.run([engine, "compose", "version"],
+                               capture_output=True, text=True, timeout=5)
+            if r.returncode == 0:
+                _COMPOSE_CMD = f"{engine} compose"
+                return _COMPOSE_CMD
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+    standalone = "podman-compose" if engine == "podman" else "docker-compose"
+    if shutil.which(standalone):
+        _COMPOSE_CMD = standalone
+        return _COMPOSE_CMD
+    _COMPOSE_CMD = f"{engine} compose"  # neither detectable — most common default
+    return _COMPOSE_CMD
+
+
+def build_docker_commands(service_info: dict | None) -> list[str]:
+    """Standard debug commands for one service's container. `logs`/`exec`/
+    `compose restart` are a container CLI's own fixed vocabulary (no
+    "dynamic source" for a tool's own command names, same as `curl -X` or
+    `git checkout`) — but WHICH engine (docker vs podman), which compose
+    invocation, and the container's shell all genuinely vary by
+    environment, so those are detected live rather than assumed."""
+    if not service_info:
+        return []
+    engine = detect_container_engine()
+    compose_cmd = detect_compose_command()
+    container = service_info["container_name"]
+    return [
+        f"{engine} logs -f {container}",
+        # bash if the image has it, falling back to sh (busybox/alpine
+        # images usually don't ship bash) — tried live, not assumed.
+        f"{engine} exec -it {container} bash || {engine} exec -it {container} sh",
+        f"{compose_cmd} -f {service_info['compose_file']} restart {service_info['service_key']}",
+    ]
+
+
+def find_frontend_dev_port(repo_path: str) -> str | None:
+    """Read the actual dev-server port straight out of the repo's own
+    package.json/vite config — no hardcoded default like 3000."""
+    pkg = os.path.join(repo_path, "package.json")
+    if os.path.isfile(pkg):
+        try:
+            with open(pkg) as fh:
+                data = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            data = {}
+        dev_script = (data.get("scripts", {}) or {}).get("dev", "")
+        m = re.search(r"--port[= ](\d+)", dev_script)
+        if m:
+            return m.group(1)
+    for cfg_name in ("vite.config.ts", "vite.config.js"):
+        cfg = os.path.join(repo_path, cfg_name)
+        if os.path.isfile(cfg):
+            try:
+                with open(cfg) as fh:
+                    text = fh.read()
+            except OSError:
+                continue
+            m = re.search(r"port:\s*(\d+)", text)
+            if m:
+                return m.group(1)
+    return None
+
+
+def route_to_curl(method: str, route_path: str, port: str | None) -> str:
+    """A real, runnable curl command for one actually-changed route."""
+    host = f"http://localhost:{port}" if port else "http://localhost:<PORT — not found in docker-compose, check the service's port mapping>"
+    if method in ("POST", "PUT", "PATCH"):
+        return f'curl -X {method} {host}{route_path} -H "Content-Type: application/json" -d \'{{}}\''
+    return f"curl -X {method} {host}{route_path}"
+
+
 def repo_root_hint(repo: str) -> str | None:
     """Return a local path for the PR's repo if we can find it cheaply.
 
     Checks, in order:
       1. current directory is inside a git repo whose remote matches `repo`
-      2. DEEPIRI_QA_WORKSPACE env var (QA's checked-out clone root)
-      3. sibling/child dirs named after the repo's short name
+      2. that repo's ancestor directories, in case cwd is itself inside a
+         nested submodule (e.g. running from deepiri-suite/, whose own git
+         top-level is deepiri-suite itself, not the platform monorepo that
+         contains it) — walks up looking for a `.gitmodules` referencing the
+         target, exactly like check 1 but from higher up the tree
+      3. DEEPIRI_QA_WORKSPACE env var (QA's checked-out clone root)
+      4. sibling/child dirs named after the repo's short name
     """
     short = repo.split("/")[-1]
     candidates: list[str] = []
-    try:
-        top = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            capture_output=True, text=True, check=True,
-        ).stdout.strip()
+
+    def add_from_top(top: str) -> None:
         candidates.append(top)
-        # If the current repo is the platform monorepo, the PR's repo may be a
-        # submodule nested deeper — resolve it via .gitmodules (cheap, exact).
+        # If `top` is a monorepo, the target repo may be a submodule nested
+        # inside it — resolve it via .gitmodules (cheap, exact).
         gm = os.path.join(top, ".gitmodules")
         if os.path.isfile(gm):
             r = subprocess.run(
@@ -1009,6 +1771,22 @@ def repo_root_hint(repo: str) -> str | None:
                 parts = line.split()
                 if len(parts) >= 2 and parts[0].endswith(".path"):
                     candidates.append(os.path.join(top, parts[1]))
+
+    try:
+        top = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        add_from_top(top)
+        # Walk up a bounded number of ancestor directories in case `top`
+        # is itself a submodule nested inside a larger monorepo checkout.
+        parent = os.path.dirname(top)
+        for _ in range(6):
+            if not parent or parent == os.path.dirname(parent):
+                break
+            if os.path.isdir(os.path.join(parent, ".git")):
+                add_from_top(parent)
+            parent = os.path.dirname(parent)
     except (subprocess.CalledProcessError, FileNotFoundError):
         pass
     ws = os.environ.get("DEEPIRI_QA_WORKSPACE")
@@ -1080,8 +1858,38 @@ def test_command_for(cd_path: str, rel_path: str, runner: str | None) -> str:
     return f"cd {cd_path} && npx jest {rel_path}"
 
 
+_RG_READY: bool | None = None
+
+
+def ensure_rg_ready() -> bool:
+    """--deep's rg_files() silently returned nothing on a machine without
+    ripgrep — not a crash, just quietly worse results. Auto-install it like
+    gh/dtm so --deep actually works out of the box. Cached per run."""
+    global _RG_READY
+    if _RG_READY is not None:
+        return _RG_READY
+    if shutil.which("rg"):
+        _RG_READY = True
+        return True
+    print("[setup] ripgrep ('rg') not found — attempting to install it...",
+          file=sys.stderr)
+    pkg_name = resolve_package_name_for_this_machine("ripgrep", "ripgrep")
+    ok = install_from_github_release("BurntSushi/ripgrep", "rg") or install_via_package_manager(
+        {m: pkg_name for m, _ in PACKAGE_MANAGERS})
+    if not ok or shutil.which("rg") is None:
+        print("[warn] could not auto-install ripgrep — --deep's cross-reference "
+              "search will find nothing. Install manually: https://github.com/BurntSushi/ripgrep",
+              file=sys.stderr)
+        _RG_READY = False
+        return False
+    _RG_READY = True
+    return True
+
+
 def rg_files(repo_path: str, pattern: str, extra_globs: list[str] | None = None) -> list[str]:
     """Files containing `pattern`, via ripgrep (gitignored dirs auto-skipped)."""
+    if not ensure_rg_ready():
+        return []
     cmd = ["rg", "-l", "--no-messages", "-g", "!node_modules", "-g", "!*.lock",
            "--glob", "*.{py,ts,tsx,js,jsx}", pattern, repo_path]
     if extra_globs:
@@ -1097,15 +1905,297 @@ def rg_files(repo_path: str, pattern: str, extra_globs: list[str] | None = None)
     return [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
 
 
+def diff_files_between(repo_path: str, old_rev: str, new_rev: str) -> list[str]:
+    try:
+        r = subprocess.run(["git", "-C", repo_path, "diff", "--name-only", old_rev, new_rev],
+                           capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        return []
+    if r.returncode != 0:
+        return []
+    return [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
+
+
+def diff_patch_for_path(repo_path: str, old_rev: str, new_rev: str, path: str) -> str:
+    """The unified diff for one path between two local revisions — the
+    submodule-bump equivalent of a PR file's `patch` field from the GitHub
+    API, so symbol/route extraction can scope to added lines here too."""
+    try:
+        r = subprocess.run(["git", "-C", repo_path, "diff", old_rev, new_rev, "--", path],
+                           capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        return ""
+    return r.stdout if r.returncode == 0 else ""
+
+
+def _scan_one_file(root: str, rev: str, path: str, cd_path: str, js_runner: str | None,
+                    backend_port: str | None, frontend_port_state: list[str],
+                    patch: str = "") -> dict | None:
+    """The per-file deep-scan logic, shared between the PR's own changed
+    files and files changed inside a bumped submodule's diff.
+    `frontend_port_state` is a shared 0/1-item list used as a lazily-filled
+    cache slot for the frontend dev port across repeated calls. `patch`, when
+    available, scopes symbol/route extraction to the lines this PR actually
+    added instead of everything defined in the whole file."""
+    if not path.endswith((".py", ".ts", ".tsx", ".js", ".jsx")):
+        return None
+    content = git_show_file(root, rev, path)
+    if content is None:
+        return None
+    changed_content = added_lines_from_patch(patch) if patch else content
+    syms = extract_symbols(changed_content, path)
+    imports = extract_imports(content)
+    routes = extract_routes(changed_content, path)
+    route_commands = [(m, p, route_to_curl(m, p, backend_port)) for m, p in routes]
+
+    visual_checks = []
+    if is_frontend_path(path):
+        if not frontend_port_state:
+            frontend_port_state.append(find_frontend_dev_port(root) or "")
+        frontend_port = frontend_port_state[0]
+        named_syms = [s for s in syms if s not in GENERIC_SYMBOLS]
+        if named_syms:
+            dev_url = (f"http://localhost:{frontend_port}" if frontend_port
+                      else "the dev server (port not found in package.json/vite.config - check how this repo's frontend starts)")
+            for s in named_syms:
+                visual_checks.append(
+                    f"Open {dev_url} and visually verify `{s}` (changed in `{path}`) - "
+                    "check it renders, layout/spacing look right, no console errors."
+                )
+    # one import hop: what do the changed files themselves touch?
+    neighbors = []
+    for imp in imports:
+        base = imp.split("/")[-1].removesuffix(".py")
+        if base and base not in (".", ".."):
+            hits = rg_files(root, rf"(from|import|require)\('?[^'\"\n]*{re.escape(base)}['\"]?")
+            neighbors += [h for h in hits if h.split("/")[-1] != path.split("/")[-1]]
+    # reverse hop: who references the changed symbols (tests + consumers)?
+    users = []
+    for s in syms:
+        if s in GENERIC_SYMBOLS:
+            continue
+        users += rg_files(root, rf"\b{re.escape(s)}\b")
+    base = path.split("/")[-1]
+    users = sorted(set(os.path.relpath(u, root) for u in users
+                       if u.split("/")[-1] != base))[:12]
+    neighbors = sorted(set(os.path.relpath(n, root) for n in neighbors))[:8]
+    test_files = sorted(set(u for u in users if any(m in u for m in TEST_MARKERS)))[:6]
+    return {
+        "path": path,
+        "content": content,
+        "symbols": syms,
+        "imports": imports,
+        "neighbors": neighbors,
+        "users": users,
+        "tests": test_files,
+        "test_commands": [test_command_for(cd_path, t, js_runner) for t in test_files],
+        "routes": route_commands,
+        "visual_checks": visual_checks,
+    }
+
+
+def fetch_repo_file_remote(repo: str, ref: str, path: str) -> str | None:
+    """A file's content straight from the GitHub API at a specific commit —
+    no local clone needed. Used when the analyzed repo has no local
+    checkout, so --deep still produces real commands instead of just
+    telling the user to go clone something first."""
+    r = gh("api", f"repos/{repo}/contents/{path}?ref={ref}", "--jq", ".content")
+    if r.returncode != 0 or not r.stdout.strip():
+        return None
+    import base64
+    try:
+        return base64.b64decode(r.stdout.strip()).decode("utf-8", errors="replace")
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+
+def resolve_relative_import(base_path: str, imp: str, known_extensions: set[str] | None = None) -> list[str]:
+    """Candidate resolved paths for a relative import spec, trying
+    extensions and index files — pure path math, no filesystem/clone
+    needed, so this works against a remote-only fetch.
+
+    `known_extensions` should be the extensions actually observed among the
+    PR's own changed files — deriving candidates from what the project is
+    actually written in, instead of a fixed hardcoded language list that
+    would silently miss anything outside it (Go, Ruby, Vue SFCs, whatever)."""
+    if not imp.startswith("."):
+        return []
+    joined = os.path.normpath(os.path.join(os.path.dirname(base_path), imp)).replace("\\", "/")
+    if os.path.splitext(joined)[1]:
+        return [joined]
+    exts = known_extensions or {".ts", ".tsx", ".js", ".jsx", ".py"}  # fallback only if nothing else is known
+    js_like = {e for e in exts if e in (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")}
+    candidates = [joined + ext for ext in exts]
+    candidates += [f"{joined}/index{ext}" for ext in (js_like or exts)]
+    return candidates
+
+
+def deep_analyze_remote(repo: str, files: list[dict], head_sha: str) -> dict:
+    """Deep scan without any local checkout — fetches each changed file's
+    content via the GitHub API instead. Gets routes/symbols/visual-checks
+    (real commands you can actually run) but not the rg-based cross-
+    reference search (who-else-references-this needs a full local tree to
+    grep, which a single-file remote fetch can't provide)."""
+    compose_root = find_compose_root()
+    short = repo.split("/")[-1]
+    service_info = find_service_info(compose_root, short) if compose_root else None
+    backend_port = service_info["port"] if service_info else None
+    docker_commands = build_docker_commands(service_info)
+
+    frontend_port_state: list[str] = []
+    pkg_json_cache: dict[str, str | None] = {}
+
+    def remote_frontend_port() -> str | None:
+        if "content" not in pkg_json_cache:
+            pkg_json_cache["content"] = fetch_repo_file_remote(repo, head_sha, "package.json")
+        content = pkg_json_cache["content"]
+        if not content:
+            return None
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError:
+            return None
+        dev_script = (data.get("scripts", {}) or {}).get("dev", "")
+        m = re.search(r"--port[= ](\d+)", dev_script)
+        return m.group(1)
+
+    changed = []
+    for f in files:
+        path = f["filename"]
+        if not path.endswith((".py", ".ts", ".tsx", ".js", ".jsx")):
+            continue
+        content = fetch_repo_file_remote(repo, head_sha, path)
+        if content is None:
+            continue
+        changed_content = added_lines_from_patch(f.get("patch") or "") or content
+        syms = extract_symbols(changed_content, path)
+        routes = extract_routes(changed_content, path)
+        route_commands = [(m, p, route_to_curl(m, p, backend_port)) for m, p in routes]
+        visual_checks = []
+        if is_frontend_path(path):
+            if not frontend_port_state:
+                frontend_port_state.append(remote_frontend_port() or "")
+            frontend_port = frontend_port_state[0]
+            named_syms = [s for s in syms if s not in GENERIC_SYMBOLS]
+            if named_syms:
+                dev_url = (f"http://localhost:{frontend_port}" if frontend_port
+                          else "the dev server (port not found remotely - check this repo's own dev-server setup)")
+                for s in named_syms:
+                    visual_checks.append(
+                        f"Open {dev_url} and visually verify `{s}` (changed in `{path}`) - "
+                        "check it renders, layout/spacing look right, no console errors."
+                    )
+        imports = extract_imports(content)
+        changed.append({
+            "path": path, "content": content, "symbols": syms, "imports": imports,
+            "neighbors": [], "users": [], "tests": [], "test_commands": [],
+            "routes": route_commands, "visual_checks": visual_checks,
+        })
+
+    # No local tree to grep for "who else references this" remotely, so the
+    # semantic signal here is different: resolve each changed file's own
+    # relative imports and fetch whichever candidate actually exists —
+    # "this file needs these to make sense" instead of "these need this".
+    changed_paths = {f["filename"] for f in files}
+    known_extensions = {os.path.splitext(p)[1] for p in changed_paths if os.path.splitext(p)[1]}
+    scores: dict[str, int] = {}
+    for entry in changed:
+        for imp in entry["imports"]:
+            for candidate in resolve_relative_import(entry["path"], imp, known_extensions):
+                if candidate in changed_paths:
+                    continue
+                scores[candidate] = scores.get(candidate, 0) + 2
+
+    context_files = []
+    for candidate, score in sorted(scores.items(), key=lambda kv: -kv[1]):
+        content = fetch_repo_file_remote(repo, head_sha, candidate)
+        if content is None:
+            continue  # not every candidate extension actually exists
+        if len(content) > MAX_CONTEXT_FILE_BYTES:
+            content = content[:MAX_CONTEXT_FILE_BYTES] + \
+                f"\n... [truncated — file is over {MAX_CONTEXT_FILE_BYTES // 1000}KB]"
+        context_files.append({"path": candidate, "content": content, "score": score})
+        if len(context_files) >= MAX_CONTEXT_FILES:
+            break
+
+    return {"available": True, "repo_path": f"{repo} (remote — no local checkout, fetched via GitHub API)",
+            "head_sha": head_sha, "files": changed, "docker_commands": docker_commands,
+            "remote_only": True, "context_files": context_files}
+
+
+MAX_CONTEXT_FILES = 25
+MAX_CONTEXT_FILE_BYTES = 50_000  # per-file cap so one huge generated/minified
+                                 # file doesn't blow out the whole bundle
+
+
+class ContextCollector:
+    """Picks up to MAX_CONTEXT_FILES *unchanged but related* files to bundle
+    full content for, alongside the PR's own changed files — the "what else
+    does an engineer (or an AI handed this plan) need open to understand
+    this change" set. Scored, not just "first N found":
+
+      +3  it's a test file that exercises a changed file
+      +2  it directly references a changed symbol ("users" from the rg hop)
+      +2  the changed file directly imports it ("neighbors")
+      +1  it sits in the same directory as the changed file
+      +1  its filename stem overlaps the changed file's stem (Foo.ts /
+          Foo.types.ts / useFoo.ts style companion files)
+
+    Scores accumulate across every changed file that references a given
+    candidate, so a shared util genuinely used everywhere naturally rises
+    to the top instead of an arbitrary first-seen file."""
+
+    def __init__(self):
+        self._scores: dict[tuple[str, str, str], int] = {}
+
+    def bump(self, root: str, rev: str, relpath: str, changed_path: str, base_score: int) -> None:
+        score = base_score
+        if os.path.dirname(relpath) == os.path.dirname(changed_path):
+            score += 1
+        changed_stem = os.path.splitext(os.path.basename(changed_path))[0].lower()
+        path_stem = os.path.splitext(os.path.basename(relpath))[0].lower()
+        if changed_stem and (changed_stem in path_stem or path_stem in changed_stem):
+            score += 1
+        key = (root, rev, relpath)
+        self._scores[key] = self._scores.get(key, 0) + score
+
+    def add_from_entry(self, root: str, rev: str, entry: dict, changed_path: str) -> None:
+        for t in entry.get("tests", []):
+            self.bump(root, rev, t, changed_path, 3)
+        for u in entry.get("users", []):
+            self.bump(root, rev, u, changed_path, 2)
+        for n in entry.get("neighbors", []):
+            self.bump(root, rev, n, changed_path, 2)
+
+    def finalize(self, exclude: set[tuple[str, str]]) -> list[dict]:
+        """Fetch content for the top-scored candidates, skipping anything
+        already covered by the PR's own changed-file list."""
+        ranked = sorted(self._scores.items(), key=lambda kv: -kv[1])
+        out = []
+        for (root, rev, relpath), score in ranked:
+            if (root, relpath) in exclude:
+                continue
+            content = git_show_file(root, rev, relpath)
+            if content is None:
+                continue
+            if len(content) > MAX_CONTEXT_FILE_BYTES:
+                content = content[:MAX_CONTEXT_FILE_BYTES] + \
+                    f"\n... [truncated — file is over {MAX_CONTEXT_FILE_BYTES // 1000}KB]"
+            out.append({"path": relpath, "content": content, "score": score})
+            if len(out) >= MAX_CONTEXT_FILES:
+                break
+        return out
+
+
 def deep_analyze(repo: str, pr: dict, files: list[dict], workspace: str | None) -> dict:
     """Scan the local repo for what specifically exercises the changed code."""
     short = repo.split("/")[-1]
     root = repo_root_hint(repo)
     head_sha = pr.get("head", {}).get("sha")
-    if not root or head_sha is None:
-        return {"available": False, "reason": "no_local_repo",
-                "clone_hint": f"git clone https://github.com/{repo}.git && "
-                              f"git -C {short} fetch origin {pr.get('head', {}).get('ref', '')}"}
+    if head_sha is None:
+        return {"available": False, "reason": "no_head_sha"}
+    if not root:
+        return deep_analyze_remote(repo, files, head_sha)
 
     if git_rev(root, head_sha) is None:
         r = subprocess.run(["git", "-C", root, "fetch", "origin",
@@ -1117,73 +2207,131 @@ def deep_analyze(repo: str, pr: dict, files: list[dict], workspace: str | None) 
 
     cd_path = os.path.relpath(root, os.getcwd()) or "."
     js_runner = detect_js_test_runner(root)
+    # Backend service info (port, container, compose service key): read live
+    # from whichever local checkout actually has docker-compose files — the
+    # repo being analyzed itself (if it's the monorepo) or the checkout this
+    # script is being run from/inside (if analyzing one of its submodules
+    # directly). No hardcoded assumption about a specific repo's name.
+    compose_root = root if find_compose_files(root) else find_compose_root()
+    service_info = find_service_info(compose_root, short) if compose_root else None
+    backend_port = service_info["port"] if service_info else None
+    docker_commands = build_docker_commands(service_info)
+    # Frontend dev-server port: read live from this repo's own package.json/
+    # vite config — computed lazily, only if a frontend file actually changed.
+    frontend_port_state: list[str] = []  # lazily-filled 0/1-item cache slot
     changed = []
+    context = ContextCollector()
     for f in files:
-        path = f["filename"]
-        if not path.endswith((".py", ".ts", ".tsx", ".js", ".jsx")):
+        entry = _scan_one_file(root, head_sha, f["filename"], cd_path, js_runner,
+                               backend_port, frontend_port_state, f.get("patch") or "")
+        if entry:
+            context.add_from_entry(root, head_sha, entry, entry["path"])
+            changed.append(entry)
+
+    # Submodule bumps show up here as a one-line gitlink pointer change, not
+    # real file diffs — the code that actually changed lives inside the
+    # bumped submodule's own commit range. If that submodule is checked out
+    # locally, scan ITS diff the same way, so a platform PR that's mostly
+    # submodule bumps still surfaces real curl/test/visual commands instead
+    # of "nothing to scan".
+    for f in files:
+        if not is_gitlink_change(f):
             continue
-        content = git_show_file(root, head_sha, path)
-        if content is None:
+        sub_path = f["filename"].rstrip("/")
+        sub_short = sub_path.split("/")[-1]
+        patch = f.get("patch") or ""
+        new_m = SUBPROJECT_SHA_RE.search(patch)
+        old_m = OLD_SUBPROJECT_SHA_RE.search(patch)
+        if not new_m or not old_m:
             continue
-        syms = extract_symbols(content, path)
-        imports = extract_imports(content)
-        # one import hop: what do the changed files themselves touch?
-        neighbors = []
-        for imp in imports:
-            base = imp.split("/")[-1].removesuffix(".py")
-            if base and base not in (".", ".."):
-                hits = rg_files(root, rf"(from|import|require)\('?[^'\"\n]*{re.escape(base)}['\"]?")
-                neighbors += [h for h in hits if h.split("/")[-1] != path.split("/")[-1]]
-        # reverse hop: who references the changed symbols (tests + consumers)?
-        users = []
-        for s in syms:
-            if s in GENERIC_SYMBOLS:
-                continue
-            users += rg_files(root, rf"\b{re.escape(s)}\b")
-        base = path.split("/")[-1]
-        def relpath(u: str) -> str:
-            return os.path.relpath(u, root)
-        users = sorted(set(relpath(u) for u in users if u.split("/")[-1] != base))[:12]
-        neighbors = sorted(set(relpath(n) for n in neighbors))[:8]
-        test_files = sorted(set(u for u in users if any(m in u for m in TEST_MARKERS)))[:6]
-        changed.append({
-            "path": path,
-            "symbols": syms,
-            "imports": imports,
-            "neighbors": neighbors,
-            "users": users,
-            "tests": test_files,
-            "test_commands": [test_command_for(cd_path, t, js_runner) for t in test_files],
-        })
+        new_sha, old_sha = new_m.group(1), old_m.group(1)
+        sub_root = repo_root_hint(f"{repo.split('/')[0]}/{sub_short}")
+        if not sub_root:
+            continue
+        if git_rev(sub_root, new_sha) is None:
+            subprocess.run(["git", "-C", sub_root, "fetch", "origin"],
+                           capture_output=True, text=True, timeout=30)
+        if git_rev(sub_root, new_sha) is None or git_rev(sub_root, old_sha) is None:
+            continue  # can't diff without both revisions present locally
+        sub_changed_paths = diff_files_between(sub_root, old_sha, new_sha)
+        if not sub_changed_paths:
+            continue
+
+        sub_cd_path = os.path.relpath(sub_root, os.getcwd()) or "."
+        sub_js_runner = detect_js_test_runner(sub_root)
+        sub_service_info = find_service_info(compose_root, sub_short) if compose_root else None
+        sub_backend_port = sub_service_info["port"] if sub_service_info else None
+        for cmd_ in build_docker_commands(sub_service_info):
+            if cmd_ not in docker_commands:
+                docker_commands.append(cmd_)
+        for sp in sub_changed_paths:
+            sub_patch = diff_patch_for_path(sub_root, old_sha, new_sha, sp)
+            entry = _scan_one_file(sub_root, new_sha, sp, sub_cd_path, sub_js_runner,
+                                   sub_backend_port, frontend_port_state, sub_patch)
+            if entry:
+                context.add_from_entry(sub_root, new_sha, entry, sp)
+                entry["path"] = f"{sub_path}/{sp}"
+                changed.append(entry)
+
+    exclude = {(root, f["filename"]) for f in files}
+    context_files = context.finalize(exclude)
 
     return {"available": True, "repo_path": root, "head_sha": head_sha,
-            "files": changed}
+            "files": changed, "docker_commands": docker_commands,
+            "context_files": context_files}
 
 
 def render_deep(deep: dict) -> list[str]:
     lines = []
     if not deep.get("available"):
-        lines.append("> **Deep scan:** no local checkout of this repo found. "
-                     f"Clone it first so the plan can find what to test:\n>\n"
-                     f"> ```bash\n> {deep.get('clone_hint')}\n> ```")
+        lines.append("> **Deep scan unavailable:** couldn't resolve this PR's head commit.")
         return lines
-    lines.append("#### What to test (deep scan of local code)")
+    lines.append("#### What to test (deep scan)")
     lines.append("")
-    lines.append(f"_Scanned `{deep.get('repo_path')}` at `{deep.get('head_sha', '')[:8]}` "
-                 "— only changed files parsed, references found via ripgrep._")
+    if deep.get("remote_only"):
+        lines.append(f"_Scanned `{deep.get('repo_path')}` at `{deep.get('head_sha', '')[:8]}` "
+                     "— no local checkout found, so this fetched each changed file's content "
+                     "directly via the GitHub API. Routes/visual-checks below are real; "
+                     "cross-reference search (who else calls this, which test exercises it) "
+                     "needs a local clone to grep across, so that part is skipped here._")
+    else:
+        lines.append(f"_Scanned `{deep.get('repo_path')}` at `{deep.get('head_sha', '')[:8]}` "
+                     "— only changed files parsed, references found via ripgrep._")
     lines.append("")
+    if deep.get("docker_commands"):
+        lines.append("- **Service commands (docker):**")
+        for cmd in deep["docker_commands"]:
+            lines.append(f"  - `{cmd}`")
+        lines.append("")
+    if deep.get("context_files"):
+        lines.append(f"- **{len(deep['context_files'])} related file(s) bundled for context** "
+                     "(full content, not just names — ranked by relevance: test coverage, "
+                     "references, shared imports, naming similarity). Not dumped here to keep "
+                     "this readable; included automatically in the `p` AI-prompt export:")
+        for cf in deep["context_files"]:
+            lines.append(f"  - `{cf['path']}` (relevance {cf['score']})")
+        lines.append("")
     any_hits = False
     for cf in deep.get("files", []):
-        if not (cf["symbols"] or cf["neighbors"] or cf["users"] or cf["tests"]):
+        if not (cf["symbols"] or cf["neighbors"] or cf["users"] or cf["tests"]
+                or cf.get("routes") or cf.get("visual_checks")):
             continue
         any_hits = True
         lines.append(f"- **`{cf['path']}`**")
         if cf["symbols"]:
             lines.append(f"  - Changed symbols/routes: `{', '.join(cf['symbols'])}`")
+        if cf.get("routes"):
+            lines.append("  - **Dynamic test commands — hit the changed route(s):**")
+            for method, route_path, curl_cmd in cf["routes"]:
+                lines.append(f"    - `{method} {route_path}`: `{curl_cmd}`")
         if cf["tests"]:
             lines.append("  - **Tests that exercise it — run these:**")
             for t, c in zip(cf["tests"], cf["test_commands"]):
                 lines.append(f"    - `{t}`: `{c}`")
+        if cf.get("visual_checks"):
+            lines.append("  - **Visual observations to check:**")
+            for vc in cf["visual_checks"]:
+                lines.append(f"    - {vc}")
         if cf["users"]:
             lines.append(f"  - Code that references it (smoke these): `{', '.join(cf['users'])}`")
         if cf["neighbors"]:
@@ -1502,17 +2650,413 @@ def _render_report_line(line: dict) -> str:
     return line["raw"]
 
 
-def run_interactive_report(md: str, export_path: str) -> bool:
+BACKTICK_RE = re.compile(r"`([^`]+)`")
+
+# OSC 52 payloads this large start hitting real terminal/multiplexer caps
+# (iTerm2/tmux default to ~1MB of raw sequence, i.e. well under this after
+# base64 overhead) — past this, sending it would either get silently
+# dropped by the terminal or truncate the clipboard content, so skip
+# straight to falling back rather than doing that.
+OSC52_MAX_BYTES = 200_000
+
+
+def _osc52_copy(text: str) -> bool:
+    """Ask the terminal itself to set its clipboard, over the same
+    stdout/tty channel already in use — no external tool, no package
+    install, no sudo. This is a terminal-emulator feature, not an OS one, so
+    it works identically on Linux, WSL, and macOS as long as the terminal
+    supports OSC 52 (iTerm2, Kitty, WezTerm, Alacritty, Windows Terminal,
+    foot, and modern xterm/gnome-terminal/tmux all do) — and unlike
+    xclip/pbcopy it keeps working over SSH, since the sequence rides the
+    existing terminal connection back to wherever the terminal itself is
+    running, not the remote host."""
+    data = text.encode("utf-8")
+    if len(data) > OSC52_MAX_BYTES:
+        return False
+    seq = f"\x1b]52;c;{base64.b64encode(data).decode('ascii')}\x07"
+    if os.environ.get("TMUX") or os.environ.get("TERM", "").startswith("screen"):
+        # tmux/screen swallow OSC sequences aimed at their own pane instead
+        # of passing them through — DCS passthrough re-wraps it so the
+        # outer terminal (the one actually holding the clipboard) sees it.
+        seq = "\x1bPtmux;" + seq.replace("\x1b", "\x1b\x1b") + "\x1b\\"
+    for target in ("/dev/tty", None):
+        try:
+            if target:
+                with open(target, "w") as tty:
+                    tty.write(seq)
+                    tty.flush()
+            else:
+                sys.stdout.write(seq)
+                sys.stdout.flush()
+            return True
+        except OSError:
+            continue
+    return False
+
+
+def copy_to_clipboard(text: str) -> bool:
+    """OSC 52 only — hand the bytes straight to the terminal over the
+    existing stdout/tty channel. No xclip/xsel/wl-copy/pbcopy probing, no
+    package install, no sudo: one path that works the same on Linux, WSL,
+    and macOS, and keeps working over SSH since it never touches the
+    remote host's own clipboard state at all."""
+    return _osc52_copy(text)
+
+
+def _copyable_text(raw: str) -> str:
+    """The command in a line, if it looks like one — prefer the last
+    backtick-fenced span (where curl/docker/test commands live), else the
+    whole line."""
+    codes = BACKTICK_RE.findall(raw)
+    return codes[-1] if codes else raw.strip()
+
+
+AI_AGENT_PROMPT_TEMPLATE = """You are acting as a QA engineer testing a pull request. Below is a complete QA test plan generated for it — environment setup, exact commands to run (curl/docker/test), visual checks, and a checklist — followed by the actual source of the changed files and related codebase context, so you're not working from the diff alone.
+
+Work through the plan end to end: run every command shown and note its actual output/exit status, open any URLs mentioned to check the UI, and check off each item as you complete it. Use the source below to understand what the change actually does before judging whether a result is correct. If a command fails or a visual check looks wrong, say so specifically (what you expected vs. what happened) rather than just marking it failed. Finish with a summary: what passed, what failed, what needs a human to look at.
+
+--- QA TEST PLAN ---
+{plan_body}
+--- END OF PLAN ---
+{codebase_context}
+Begin now."""
+
+
+def _format_file_block(path: str, content: str, note: str = "") -> str:
+    return f"\n### {path}{f' ({note})' if note else ''}\n```\n{content}\n```\n"
+
+
+def synthesize_ai_prompt(lines: list[dict], deep: dict | None = None) -> str:
+    """Package the current state of the report (including any checkboxes
+    already toggled) into a single prompt an AI coding assistant can be
+    handed to execute the whole test plan — plus the actual full content of
+    every changed file and up to MAX_CONTEXT_FILES semantically-related
+    unchanged files, not just the diff, so the assistant has real codebase
+    context instead of an isolated patch."""
+    plan_body = "\n".join(_render_report_line(l) for l in lines)
+    codebase_context = ""
+    if deep and deep.get("available"):
+        blocks = []
+        changed_files = deep.get("files", [])
+        context_files = deep.get("context_files", [])
+        if changed_files or context_files:
+            blocks.append("\n--- CODEBASE CONTEXT ---")
+        for cf in changed_files:
+            if cf.get("content"):
+                blocks.append(_format_file_block(cf["path"], cf["content"], "changed"))
+        for cf in context_files:
+            blocks.append(_format_file_block(cf["path"], cf["content"],
+                                             f"related, relevance {cf['score']}"))
+        if len(blocks) > 1:
+            blocks.append("--- END CODEBASE CONTEXT ---\n")
+            codebase_context = "\n".join(blocks)
+    return AI_AGENT_PROMPT_TEMPLATE.format(plan_body=plan_body, codebase_context=codebase_context)
+
+
+URL_RE = re.compile(r"https?://\S+")
+
+
+def _extract_url(raw: str) -> str | None:
+    m = URL_RE.search(raw)
+    return m.group(0).rstrip(").,'\"") if m else None
+
+
+def _run_shell_capture(cmd: str, timeout: int = 30) -> tuple[int, str]:
+    try:
+        r = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True,
+                           timeout=timeout)
+        return r.returncode, (r.stdout or "") + (r.stderr or "")
+    except subprocess.TimeoutExpired:
+        return -1, f"[timed out after {timeout}s — command may still be running in the background]"
+    except OSError as e:
+        return -1, f"[failed to launch: {e}]"
+
+
+def _show_output_pane(stdscr, curses, title: str, output: str, teal_attr) -> None:
+    """Scrollable pane showing captured command output inline in the same
+    terminal — this is the "visualize the output" ask: results appear right
+    here, not in a separate window/terminal."""
+    out_lines = output.splitlines() or ["(no output)"]
+    top = 0
+    while True:
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        stdscr.addnstr(0, 0, f" {title}", max(0, w - 1), curses.A_BOLD)
+        body_h = max(1, h - 2)
+        for row in range(body_h):
+            li = top + row
+            if li >= len(out_lines):
+                break
+            try:
+                stdscr.addnstr(row + 1, 0, out_lines[li], max(0, w - 1))
+            except curses.error:
+                pass
+        footer = " up/down or j/k scroll   any other key: continue"
+        try:
+            stdscr.addnstr(h - 1, 0, footer[:w - 1], max(0, w - 1), teal_attr)
+        except curses.error:
+            pass
+        stdscr.refresh()
+        key = stdscr.getch()
+        if key in (curses.KEY_DOWN, ord("j")):
+            top = min(top + 1, max(0, len(out_lines) - body_h))
+        elif key in (curses.KEY_UP, ord("k")):
+            top = max(top - 1, 0)
+        else:
+            return
+
+
+def _looks_like_a_command(text: str) -> bool:
+    """A real command is a multi-token invocation (verb + args, e.g.
+    `docker logs -f x` or `pytest tests/foo.py -v`) — a bare identifier in
+    backticks like a branch name (`peytonli/fix/ui-ux-fixes`) or a file
+    path is a single token and isn't one, even though it's technically a
+    "code span" too. A comma-separated span (`fooBar, bazQux, quux`) is a
+    listing of names — symbols, imports, reverse-references — not an
+    invocation; no shell command takes its positional args that way, so a
+    comma anywhere in the span rules it out regardless of which report
+    section produced it."""
+    text = text.strip()
+    if "," in text:
+        return False
+    return " " in text
+
+
+def _is_command_carrier(raw: str, kind: str) -> bool:
+    """A line actually carries a runnable command — not just prose that
+    happens to mention `something` in code font, and not a metadata bullet
+    like "- **Branch:** `a` → `b`" whose backtick spans are bare
+    identifiers, not commands. Checkbox lines with an embedded command
+    (health-check/sorge-pass style) count; otherwise the line must itself
+    be a bullet ("  - `cmd`" / "    - `label`: `cmd`")."""
+    if not BACKTICK_RE.search(raw):
+        return False
+    if not _looks_like_a_command(_copyable_text(raw)):
+        return False
+    if kind == "checkbox":
+        return True
+    return raw.strip().startswith("-")
+
+
+def _walkthrough_step_kind(line: dict, raw: str) -> str:
+    """Classify a step for the friendlier per-step framing: what kind of
+    action does this line actually ask for?"""
+    if _is_command_carrier(raw, line["kind"]):
+        return "command"
+    if URL_RE.search(raw):
+        return "visual"
+    return "checklist"
+
+
+_STEP_KIND_DISPLAY = {
+    "command": ("RUN A COMMAND", "green"),
+    "visual": ("VISUAL CHECK", "magenta"),
+    "checklist": ("CHECKLIST ITEM", "yellow"),
+}
+
+
+def _is_walkthrough_step(line: dict) -> bool:
+    """Does this parsed report line earn its own guided-walkthrough step?
+    One predicate, shared between step collection and the regression suite —
+    it used to exist only inline inside run_guided_walkthrough(), so markdown
+    changes could silently drop steps from the walkthrough while the static
+    report still showed them."""
+    return (line["kind"] == "checkbox"
+            or _is_command_carrier(line["raw"], line["kind"])
+            or bool(URL_RE.search(line["raw"])))
+
+
+def run_guided_walkthrough(stdscr, curses, lines: list[dict], colors: dict) -> None:
+    """Step through every actionable line one at a time: run its command
+    inline (output shown in the same terminal, not a separate window), open
+    a browser tab for anything with a URL (visual checks), or just mark a
+    checklist item done, then move on. This is the "walk me through testing
+    this PR" ask — each step is framed by what it's actually asking you to
+    do, not just a raw markdown line dump."""
+    actionable = [i for i, l in enumerate(lines) if _is_walkthrough_step(l)]
+    if not actionable:
+        return
+    idx = 0
+    while 0 <= idx < len(actionable):
+        li = actionable[idx]
+        line = lines[li]
+        raw = _render_report_line(line)
+        cmd = _copyable_text(raw)
+        is_runnable = (_is_command_carrier(raw, line["kind"])
+                      and not cmd.lower().startswith(("http://", "https://")))
+        url = _extract_url(raw)
+        step_kind = _walkthrough_step_kind(line, raw)
+        badge_text, badge_color_name = _STEP_KIND_DISPLAY[step_kind]
+        badge_attr = colors.get(badge_color_name, colors["teal"])
+
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        stdscr.addnstr(0, 0, f" Guided walkthrough — step {idx + 1}/{len(actionable)}",
+                       max(0, w - 1), colors["header"])
+        try:
+            stdscr.addnstr(1, 0, f" [{badge_text}]", max(0, w - 1), badge_attr | curses.A_REVERSE)
+        except curses.error:
+            pass
+        if line["kind"] == "checkbox":
+            mark = "[x] DONE" if line["checked"] else "[ ] not done yet"
+            try:
+                stdscr.addnstr(1, len(badge_text) + 5, f"  {mark}", max(0, w - 1),
+                               colors["checked"] if line["checked"] else curses.A_DIM)
+            except curses.error:
+                pass
+
+        # The question this step is actually asking, in plain language,
+        # instead of just dumping the raw markdown line.
+        question = {
+            "command": "Ready to run this?",
+            "visual": "Ready to open this in your browser and take a look?",
+            "checklist": "Mark this done once you've handled it.",
+        }[step_kind]
+        try:
+            stdscr.addnstr(3, 2, question, max(0, w - 3), curses.A_BOLD)
+        except curses.error:
+            pass
+
+        body_top = 5
+        for i, chunk_start in enumerate(range(0, max(len(raw), 1), max(1, w - 4))):
+            if body_top + i >= h - 2:
+                break
+            try:
+                stdscr.addnstr(body_top + i, 2, raw[chunk_start:chunk_start + w - 4],
+                               max(0, w - 4))
+            except curses.error:
+                pass
+
+        opts = []
+        if line["kind"] == "checkbox":
+            opts.append("space: mark done")
+        if is_runnable:
+            opts.append("r: run this command")
+        if url:
+            opts.append("o: open in browser")
+        opts += ["← back", "→ next", "q: exit walkthrough"]
+        try:
+            stdscr.addnstr(h - 1, 0, "   ".join(opts)[:w - 1], max(0, w - 1), colors["teal"])
+        except curses.error:
+            pass
+        stdscr.refresh()
+
+        key = stdscr.getch()
+        if key == ord("q"):
+            return
+        if key == curses.KEY_RIGHT:
+            idx += 1
+        elif key == curses.KEY_LEFT:
+            idx = max(0, idx - 1)
+        elif key in (ord(" "), 10, 13, curses.KEY_ENTER) and line["kind"] == "checkbox":
+            line["checked"] = not line["checked"]
+        elif key == ord("r") and is_runnable:
+            # subprocess.run() below blocks the whole UI thread for up to
+            # _run_shell_capture's timeout — paint a status first so a slow
+            # command reads as "running" instead of a dead/frozen screen.
+            try:
+                stdscr.addnstr(h - 1, 0,
+                               f" running: {cmd}  (up to 30s — UI is busy, please wait)"[:w - 1],
+                               max(0, w - 1), colors["teal"] | curses.A_BOLD)
+            except curses.error:
+                pass
+            stdscr.refresh()
+            rc, output = _run_shell_capture(cmd)
+            # Anything typed while the UI was blocked above (e.g. impatient
+            # repeated "b"/"n" presses) is sitting in the terminal's input
+            # queue — without this it gets replayed into the output pane's
+            # own getch() and silently closes it, which reads as "the key
+            # doesn't work" once control returns to the walkthrough.
+            curses.flushinp()
+            _show_output_pane(stdscr, curses, f"$ {cmd}   (exit {rc})", output, colors["teal"])
+            curses.flushinp()
+        elif key == ord("o") and url:
+            try:
+                webbrowser.open(url)
+            except Exception:
+                pass
+
+
+def _pick_export_path(stdscr, curses, start_dir: str, default_filename: str) -> str | None:
+    """Inline mini file browser: navigate real directories from start_dir,
+    Enter descends into a folder or (on the save entry) prompts for a
+    filename in the current folder. Esc/q cancels."""
+    cur_dir = os.path.abspath(start_dir)
+    sel = 0
+    while True:
+        try:
+            entries = os.listdir(cur_dir)
+        except OSError:
+            entries = []
+        dirs = sorted(e for e in entries if os.path.isdir(os.path.join(cur_dir, e))
+                     and not e.startswith("."))
+        files = sorted(e for e in entries if not os.path.isdir(os.path.join(cur_dir, e))
+                       and not e.startswith("."))
+        rows = [f"[Save here as {default_filename}]", ".. (up one level)"]
+        rows += [f"{d}/" for d in dirs] + files
+        sel = max(0, min(sel, len(rows) - 1))
+
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        stdscr.addnstr(0, 0, f" Export to — current folder: {cur_dir}", max(0, w - 1),
+                       curses.A_BOLD)
+        for i, row in enumerate(rows):
+            r = i + 2
+            if r >= h - 1:
+                break
+            attr = curses.A_REVERSE if i == sel else curses.A_NORMAL
+            stdscr.addnstr(r, 2, row, max(0, w - 3), attr)
+        footer = " up/down or j/k move   Enter open/select   Esc/q cancel"
+        try:
+            stdscr.addnstr(h - 1, 0, footer[:w - 1], max(0, w - 1), curses.A_DIM)
+        except curses.error:
+            pass
+        stdscr.refresh()
+
+        key = stdscr.getch()
+        if key in (ord("q"), 27):
+            return None
+        if key in (ord("j"), curses.KEY_DOWN):
+            sel = min(sel + 1, len(rows) - 1)
+        elif key in (ord("k"), curses.KEY_UP):
+            sel = max(sel - 1, 0)
+        elif key in (10, 13, curses.KEY_ENTER):
+            choice = rows[sel]
+            if choice.startswith("[Save here"):
+                prompt = f" Filename [{default_filename}]: "
+                stdscr.addnstr(h - 1, 0, prompt, max(0, w - 1))
+                curses.echo()
+                curses.curs_set(1)
+                try:
+                    raw = stdscr.getstr(h - 1, min(len(prompt), w - 1), 80)
+                finally:
+                    curses.curs_set(0)
+                    curses.noecho()
+                name = raw.decode("utf-8", errors="replace").strip() or default_filename
+                return os.path.join(cur_dir, name)
+            if choice == ".. (up one level)":
+                cur_dir = os.path.dirname(cur_dir) or cur_dir
+                sel = 0
+            elif choice.endswith("/"):
+                cur_dir = os.path.join(cur_dir, choice[:-1])
+                sel = 0
+            else:
+                return os.path.join(cur_dir, choice)
+
+
+def run_interactive_report(md: str, export_path: str, deep: dict | None = None) -> bool:
     """Curses checklist viewer over the generated plan. Returns True if it
     ran (caller shouldn't also flat-print); False if curses isn't usable
-    here and the caller should fall back to a plain print."""
+    here and the caller should fall back to a plain print. `deep` (if
+    available) carries full changed-file + related-file content, bundled
+    into the 'p' AI-prompt export so it's not just working from the diff."""
     try:
         import curses
     except ImportError:
         return False
 
     lines = _parse_report_lines(md)
-    checkbox_idx = [i for i, l in enumerate(lines) if l["kind"] == "checkbox"]
+    default_filename = os.path.basename(export_path)
 
     def loop(stdscr):
         curses.curs_set(0)
@@ -1521,24 +3065,29 @@ def run_interactive_report(md: str, export_path: str) -> bool:
         curses.init_pair(1, curses.COLOR_CYAN, -1)
         curses.init_pair(2, curses.COLOR_BLUE, -1)
         curses.init_pair(3, curses.COLOR_GREEN, -1)
+        curses.init_pair(4, curses.COLOR_MAGENTA, -1)
+        curses.init_pair(5, curses.COLOR_YELLOW, -1)
         teal_attr = curses.color_pair(1) | curses.A_BOLD
         header_attr = curses.color_pair(2) | curses.A_BOLD
         checked_attr = curses.color_pair(3)
+        colors = {
+            "teal": teal_attr, "header": header_attr, "checked": checked_attr,
+            "magenta": curses.color_pair(4) | curses.A_BOLD,
+            "yellow": curses.color_pair(5) | curses.A_BOLD,
+        }
 
         top = 0
-        cursor = 0 if checkbox_idx else -1
+        cursor = 0  # index into `lines` — moves across every line, not just checkboxes
         status = ""
 
         while True:
             stdscr.erase()
             h, w = stdscr.getmaxyx()
             body_h = max(1, h - 2)
-            cur_line = checkbox_idx[cursor] if cursor >= 0 else -1
-            if cur_line >= 0:
-                if cur_line < top:
-                    top = cur_line
-                elif cur_line >= top + body_h:
-                    top = cur_line - body_h + 1
+            if cursor < top:
+                top = cursor
+            elif cursor >= top + body_h:
+                top = cursor - body_h + 1
 
             for row in range(body_h):
                 li = top + row
@@ -1551,15 +3100,15 @@ def run_interactive_report(md: str, export_path: str) -> bool:
                     attr = header_attr
                 elif line["kind"] == "checkbox":
                     attr = checked_attr if line["checked"] else curses.A_NORMAL
-                    if li == cur_line:
-                        attr |= curses.A_REVERSE
+                if li == cursor:
+                    attr |= curses.A_REVERSE
                 try:
                     stdscr.addnstr(row, 0, text, max(0, w - 1), attr)
                 except curses.error:
                     pass
 
-            footer = (" ↑/↓ or j/k move   space toggle   e export   q quit"
-                     f"   {status}")
+            footer = (" ↑/↓ or j/k move   space toggle   c copy all   l copy line   p AI prompt"
+                     f"   w walkthrough   e export   q quit   {status}")
             try:
                 stdscr.addnstr(h - 1, 0, footer[:w - 1], max(0, w - 1), teal_attr)
             except curses.error:
@@ -1570,25 +3119,55 @@ def run_interactive_report(md: str, export_path: str) -> bool:
             if key in (ord("q"), 27):
                 return
             if key in (ord("j"), curses.KEY_DOWN):
-                if checkbox_idx:
-                    cursor = min(cursor + 1, len(checkbox_idx) - 1)
-                else:
-                    top = min(top + 1, max(0, len(lines) - body_h))
+                cursor = min(cursor + 1, len(lines) - 1)
+                status = ""
             elif key in (ord("k"), curses.KEY_UP):
-                if checkbox_idx:
-                    cursor = max(cursor - 1, 0)
-                else:
-                    top = max(top - 1, 0)
+                cursor = max(cursor - 1, 0)
+                status = ""
             elif key in (ord(" "), 10, 13, curses.KEY_ENTER):
-                if cur_line >= 0:
-                    lines[cur_line]["checked"] = not lines[cur_line]["checked"]
+                if lines[cursor]["kind"] == "checkbox":
+                    lines[cursor]["checked"] = not lines[cursor]["checked"]
+            elif key == ord("c"):
+                text_to_copy = "\n".join(_render_report_line(l) for l in lines)
+                status = (f"[copied whole report — {len(lines)} lines]"
+                         if copy_to_clipboard(text_to_copy)
+                         else "[copy failed — your terminal may not support OSC 52; "
+                              "use 'e' to export instead]")
+            elif key == ord("l"):
+                text_to_copy = _copyable_text(_render_report_line(lines[cursor]))
+                status = (f"[copied line: {text_to_copy[:40]}{'...' if len(text_to_copy) > 40 else ''}]"
+                         if copy_to_clipboard(text_to_copy)
+                         else "[copy failed — your terminal may not support OSC 52; "
+                              "use 'e' to export instead]")
+            elif key == ord("p"):
+                prompt_text = synthesize_ai_prompt(lines, deep)
+                if copy_to_clipboard(prompt_text):
+                    status = "[AI prompt copied to clipboard — paste into your assistant]"
+                else:
+                    chosen = _pick_export_path(stdscr, curses, os.getcwd(), "qa-plan-ai-prompt.txt")
+                    if chosen:
+                        try:
+                            with open(chosen, "w") as f:
+                                f.write(prompt_text + "\n")
+                            status = f"[no clipboard tool — saved prompt to {chosen} instead]"
+                        except OSError as e:
+                            status = f"[save failed: {e}]"
+                    else:
+                        status = "[no clipboard tool found, and export cancelled]"
+            elif key == ord("w"):
+                run_guided_walkthrough(stdscr, curses, lines, colors)
+                status = "[walkthrough ended]"
             elif key == ord("e"):
-                try:
-                    with open(export_path, "w") as f:
-                        f.write("\n".join(_render_report_line(l) for l in lines) + "\n")
-                    status = f"[saved {export_path}]"
-                except OSError as e:
-                    status = f"[save failed: {e}]"
+                chosen = _pick_export_path(stdscr, curses, os.getcwd(), default_filename)
+                if chosen:
+                    try:
+                        with open(chosen, "w") as f:
+                            f.write("\n".join(_render_report_line(l) for l in lines) + "\n")
+                        status = f"[saved {chosen}]"
+                    except OSError as e:
+                        status = f"[save failed: {e}]"
+                else:
+                    status = "[export cancelled]"
 
     curses.wrapper(loop)
     return True
@@ -1621,12 +3200,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--json", action="store_true", help="print plan as JSON")
     ap.add_argument("--comment", action="store_true", help="post plan as PR comment")
     ap.add_argument("--deep", action="store_true",
-                    help="scan local checkout to find exactly what to test")
+                    help="(default on) scan local checkout for exact test "
+                         "commands, curl commands, and visual checks — kept "
+                         "as a no-op flag for backward compatibility")
+    ap.add_argument("--no-deep", action="store_true",
+                    help="skip the local-checkout deep scan (faster, but no "
+                         "curl/visual-check/exact-test-file output)")
     ap.add_argument("--workspace", help="dir to search for local clones "
                                         "(default: $DEEPIRI_QA_WORKSPACE)")
     ap.add_argument("--out", help="write markdown plan to this file")
     ap.add_argument("--skip-setup", action="store_true",
                     help="skip the automatic gh CLI install/auth check")
+    ap.add_argument("--regression-test", action="store_true",
+                    help="run the built-in regression suite and exit "
+                         "(pure logic checks always; live checks against "
+                         "known PRs if gh is authenticated)")
     ap.add_argument("--interactive", action="store_true",
                     help="launch the QA ASSIST interactive menu")
     ap.add_argument("--plain", action="store_true",
@@ -1673,15 +3261,15 @@ def run_plan(args) -> None:
             page += 1
 
     with Spinner("Building service map (dtm / .gitmodules)..."):
-        service_map = build_service_map(args.org)
-    plan = analyze(files, service_map)
+        service_map = build_service_map(args.repo, args.org)
+    plan = analyze(files, service_map, repo=args.repo, ref=pr.get("head", {}).get("sha"))
     plan["pr_url"] = pr.get("html_url")
     plan["repo"] = args.repo
     with Spinner("Checking cross-PR references and submodule bumps..."):
         plan["referenced_prs"] = find_referenced_prs(args.repo, pr.get("body") or "",
                                                      pr.get("number", 0))
         plan["submodule_bump_details"] = resolve_submodule_bumps(files, args.org)
-    if args.deep:
+    if not args.no_deep:
         with Spinner("Deep-scanning local checkout..."):
             plan["deep"] = deep_analyze(args.repo, pr, files, args.workspace)
 
@@ -1699,7 +3287,7 @@ def run_plan(args) -> None:
     shown_interactively = False
     if not args.plain and sys.stdout.isatty():
         default_export = args.out or f"qa-plan-{args.repo.split('/')[-1]}-{pr_number}.md"
-        shown_interactively = run_interactive_report(md, default_export)
+        shown_interactively = run_interactive_report(md, default_export, plan.get("deep"))
     if not shown_interactively:
         print(md)
 
@@ -1745,10 +3333,10 @@ def run_interactive(base_args) -> None:
             args.pr = int(pr_in) if pr_in else None
 
         if action == "plan":
-            args.deep = False
+            args.no_deep = True
             run_plan(args)
         elif action == "deep":
-            args.deep = True
+            args.no_deep = False
             run_plan(args)
         elif action == "review":
             args.review_check = True
@@ -1769,11 +3357,199 @@ def run_interactive(base_args) -> None:
             run_review_check(args)
 
 
+def run_regression_tests() -> bool:
+    """--regression-test: a fixed suite catching the exact class of
+    regressions found live while building this script this session — bad
+    symbol extraction, broken route parsing, review-quality misclassification,
+    and wrong area/test-command classification against real PRs. Pure-logic
+    checks always run; live checks against known PRs run only if `gh` is
+    authenticated, and are skipped (not failed) if it isn't — this suite
+    shouldn't require network/auth to be useful in CI."""
+    results: list[tuple[str, bool]] = []
+
+    def check(name: str, condition: bool) -> None:
+        results.append((name, bool(condition)))
+        icon = f"{TEAL}PASS{RESET}" if condition else f"{BOLD}FAIL{RESET}"
+        print(f"  [{icon}] {name}", file=sys.stderr)
+
+    print(f"{BOLD}{BLUE}QA ASSIST regression suite{RESET}", file=sys.stderr)
+    print("-- pure logic --", file=sys.stderr)
+
+    check("export-default-function symbol extraction",
+          extract_symbols("export default function Home() {}", "x.tsx") == ["Home"])
+    check("export-default-class symbol extraction",
+          extract_symbols("export default class Foo {}", "x.tsx") == ["Foo"])
+    check("bare export-default identifier symbol extraction",
+          extract_symbols("const Bar = () => null\nexport default Bar\n", "x.tsx") == ["Bar"])
+    check("multi-line route call detected",
+          extract_routes("router.post(\n  \"/x\",", "x.ts") == [("POST", "/x")])
+    check("HTTP_METHODS includes the core verbs",
+          {"get", "post", "put", "delete", "patch"} <= set(HTTP_METHODS))
+    check("review: fully compliant body",
+          evaluate_review("Environment: x\nHealth check: y\nSorge pass: z\n"
+                          "Manual testing: w\nAutomated tests: v")["compliant"])
+    check("review: bare LGTM flagged incomplete",
+          not evaluate_review("LGTM")["compliant"])
+    check("review: template placeholder left in flagged",
+          "Environment" in evaluate_review(
+              "Environment: [qa-team stack, build vs start]\nHealth check: ok\n"
+              "Sorge pass: ok\nManual testing: ok\nAutomated tests: ok")["placeholder"])
+    _real_fetch_reviews = fetch_reviews
+    globals()["fetch_reviews"] = lambda repo, pr: [
+        {"user": "a", "state": "APPROVED", "body": "LGTM",
+         "submitted_at": "t1", "html_url": "u1"},
+        {"user": "a", "state": "APPROVED",
+         "body": "Environment: x\nHealth check: y\nSorge pass: z\n"
+                 "Manual testing: w\nAutomated tests: v",
+         "submitted_at": "t2", "html_url": "u2"},
+    ]
+    try:
+        check("review: a reviewer's later re-review overrides their earlier one",
+              check_pr_review("org/repo", 1)["verdict"] == "compliant")
+    finally:
+        globals()["fetch_reviews"] = _real_fetch_reviews
+    check("detect_container_engine returns a known engine",
+          detect_container_engine() in KNOWN_CONTAINER_ENGINES)
+    check("scan_for_package_manager_state finds real on-disk evidence "
+         "(or None) without crashing",
+          scan_for_package_manager_state() in
+              (None, *_PACKAGE_MANAGER_STATE_PATHS.keys()))
+    check("scan_for_container_engine_state finds real on-disk evidence "
+         "(or None) without crashing",
+          scan_for_container_engine_state() in
+              (None, *_CONTAINER_ENGINE_STATE_PATHS.keys()))
+    check("resolve_relative_import resolves a bare relative import",
+          "src/db.ts" in resolve_relative_import("src/server.ts", "./db", {".ts"}))
+    check("_is_command_carrier rejects prose that merely mentions a `code span`",
+          not _is_command_carrier(
+              "_follows the `deepiri-qa-workflow` skill_", "text"))
+    check("_is_command_carrier accepts a real command bullet",
+          _is_command_carrier("  - `docker logs -f x`", "text"))
+    check("_is_command_carrier rejects a metadata bullet with bare-"
+         "identifier backtick spans (branch names, not commands)",
+          not _is_command_carrier(
+              "- **Branch:** `peytonli/fix/ui-ux-fixes` → `peytonli/feat/ai-prompt-loop`",
+              "text"))
+    check("_looks_like_a_command rejects comma-separated name listings",
+          not _looks_like_a_command("delete_project, prune_orphans"))
+    check("added_lines_from_patch keeps just the added lines",
+          added_lines_from_patch("--- a/f\n+++ b/f\n@@ -1 +1 @@\n-old line\n"
+                                 "+new line\n context") == "new line")
+
+    # Regression for the "walkthrough only shows npm test" bug: changed
+    # backend functions must reach the guided walkthrough. Rendered as plain
+    # sub-bullets they satisfied none of its step rules (checkbox / runnable
+    # command / URL) and were silently skipped even though the static report
+    # showed them — so the walkthrough fell through to the next real step.
+    _real_related = find_related_prs
+    globals()["find_related_prs"] = lambda *a, **k: []
+    try:
+        _md = render_markdown(
+            {"areas": {"Orchestrator": {
+                 "files": ["services/orchestrator/app/db_repos.py"],
+                 "additions": 10, "deletions": 2, "test_command": "pytest"}},
+             "risks": [], "total_files": 1, "total_additions": 10,
+             "total_deletions": 2, "tests_included": False,
+             "submodule_bumps": [], "rebuild_needed": False,
+             "frontend_touched": False, "backend_touched": True,
+             "frontend_paths": [],
+             "backend_paths": ["services/orchestrator/app/db_repos.py"],
+             "deep": {"available": True, "repo_path": "/tmp/x", "head_sha": "abc123",
+                      "files": [{"path": "services/orchestrator/app/db_repos.py",
+                                 "symbols": ["delete_project", "logger"],
+                                 "neighbors": [], "users": [], "tests": [],
+                                 "routes": [], "visual_checks": []},
+                                {"path": "services/orchestrator/tests/test_db_repos.py",
+                                 "symbols": ["TestDeleteProject", "test_delete_project"],
+                                 "neighbors": [], "users": [], "tests": [],
+                                 "routes": [], "visual_checks": []}]}},
+            {"title": "t", "number": 1,
+             "head": {"ref": "b"}, "base": {"ref": "main"}},
+            "org/repo")
+    finally:
+        globals()["find_related_prs"] = _real_related
+    _fn_steps = [l for l in _parse_report_lines(_md)
+                 if l["kind"] == "checkbox" and "delete_project" in l["raw"]
+                 and "db_repos.py" in l["raw"]]
+    check("changed backend functions become walkthrough steps (not skipped "
+         "like plain bullets were)",
+          len(_fn_steps) == 1 and _is_walkthrough_step(_fn_steps[0]))
+    check("a changed-function step is a checklist item, not a bogus "
+         "runnable command",
+          len(_fn_steps) == 1
+          and _walkthrough_step_kind(_fn_steps[0],
+                                     _render_report_line(_fn_steps[0])) == "checklist"
+          and not _is_command_carrier(_render_report_line(_fn_steps[0]), "checkbox"))
+    check("test-file symbols stay out of the manual per-function checklist "
+         "(deep scan may still list them informationally)",
+          not any(l["kind"] == "checkbox" and "test_db_repos" in l["raw"]
+                  for l in _parse_report_lines(_md)))
+
+    print("-- live checks (network; skipped on failure, not failed) --", file=sys.stderr)
+    try:
+        rg_name = resolve_package_name_for_this_machine("ripgrep", "ripgrep")
+        # Regression: repology's srcname for ripgrep on Debian/Ubuntu is
+        # "rust-ripgrep" (the source package) — `apt install rust-ripgrep`
+        # doesn't exist; the actual installable package is "ripgrep"
+        # (binnames). Caught live before this check existed. Only
+        # meaningful on a machine repology_repo_hint() can resolve.
+        if repology_repo_hint():
+            check("repology: this machine's package name is the "
+                 "installable binary name, not the source package name",
+                  rg_name == "ripgrep")
+    except Exception as e:
+        print(f"  [skip] repology check unavailable: {e}", file=sys.stderr)
+
+    print("-- live checks (real GitHub PRs; skipped if gh isn't authenticated) --",
+         file=sys.stderr)
+    if gh("auth", "status").returncode != 0:
+        print("  [skip] gh not authenticated — live checks skipped", file=sys.stderr)
+    else:
+        try:
+            platform_files = gh_json(
+                "repos/Team-Deepiri/deepiri-platform/pulls/314/files?per_page=100")
+            platform_map = build_service_map("Team-Deepiri/deepiri-platform", ORG)
+            platform_plan = analyze(platform_files, platform_map,
+                                    repo="Team-Deepiri/deepiri-platform")
+            check("platform#314: API Gateway classified with npm test",
+                  "npm test" in platform_plan["areas"]
+                      .get("API Gateway", {}).get("test_command", ""))
+            check("platform#314: Sugar Glider classified with go test (regression: "
+                 "the old hardcoded SERVICE_MAP said pytest — it's actually Go)",
+                  "go test" in platform_plan["areas"]
+                      .get("Sugar Glider (shared)", {}).get("test_command", ""))
+
+            rf_pr = gh_json("repos/Team-Deepiri/deepiri-renderflow-studio/pulls/92")
+            rf_files = gh_json(
+                "repos/Team-Deepiri/deepiri-renderflow-studio/pulls/92/files?per_page=100")
+            rf_map = build_service_map("Team-Deepiri/deepiri-renderflow-studio", ORG)
+            rf_plan = analyze(rf_files, rf_map, repo="Team-Deepiri/deepiri-renderflow-studio",
+                             ref=rf_pr.get("head", {}).get("sha"))
+            check("renderflow-studio#92: classified under its own repo name, "
+                 "not dumped into (unknown / other)",
+                  "Renderflow Studio" in rf_plan["areas"])
+            check("renderflow-studio#92: TypeScript PR gets npm test, not a "
+                 "repo-wide-language misfire",
+                  rf_plan["areas"].get("Renderflow Studio", {}).get("test_command") == "npm test")
+        except RuntimeError as e:
+            print(f"  [skip] live checks failed to fetch: {e}", file=sys.stderr)
+
+    n_pass = sum(1 for _, ok in results if ok)
+    all_ok = n_pass == len(results)
+    print(f"\n{n_pass}/{len(results)} checks passed" +
+         (f" — {BOLD}all green{RESET}" if all_ok else f" — {BOLD}FAILURES ABOVE{RESET}"),
+         file=sys.stderr)
+    return all_ok
+
+
 def main():
     args = build_arg_parser().parse_args()
 
     if not args.json:
         print_banner()
+
+    if args.regression_test:
+        sys.exit(0 if run_regression_tests() else 1)
 
     ensure_gh_ready(skip=args.skip_setup)
     maybe_install_opencode(skip=args.skip_setup)
