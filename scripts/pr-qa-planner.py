@@ -877,11 +877,15 @@ def render_markdown(plan: dict, pr: dict, repo: str) -> str:
                  "Approve or Request Changes.")
     lines.append("")
 
-    lines.append("<details><summary>Changed files</summary>")
-    lines.append("")
-    for f in sorted(plan["areas"].get("(unknown / other)", {}).get("files", [])):
-        lines.append(f"- `{f}`")
-    lines.append("</details>")
+    all_changed = sorted(
+        f for area in plan["areas"].values() for f in area.get("files", [])
+    )
+    if all_changed:
+        lines.append("<details><summary>Changed files</summary>")
+        lines.append("")
+        for f in all_changed:
+            lines.append(f"- `{f}`")
+        lines.append("</details>")
     return "\n".join(lines)
 
 
