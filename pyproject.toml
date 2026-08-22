@@ -1,0 +1,14 @@
+[project]
+name = "deepiri-suite"
+version = "0.1.0"
+description = "Team-Deepiri platform suite: ops scripts, dev-environment tooling, and the PR QA test planner."
+authors = [{ name = "Team-Deepiri" }]
+readme = "README.md"
+requires-python = ">=3.10"
+
+[tool.poetry]
+package-mode = false
+
+[build-system]
+requires = ["poetry-core>=2.0.0"]
+build-backend = "poetry.core.masonry.api"
