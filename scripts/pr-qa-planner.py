@@ -520,6 +520,46 @@ def _install_gh() -> bool:
             return False
     return False
 
+
+def _install_rg() -> bool:
+    """Best-effort install of ripgrep via the current platform's package
+    manager, mirroring the fallback cascade used for gh above."""
+    system = platform.system()
+    try:
+        if system == "Darwin" and shutil.which("brew"):
+            return subprocess.run(["brew", "install", "ripgrep"]).returncode == 0
+        if system == "Linux":
+            if shutil.which("apt-get"):
+                return subprocess.run(["sudo", "apt-get", "install", "-y", "ripgrep"]).returncode == 0
+            if shutil.which("dnf"):
+                return subprocess.run(["sudo", "dnf", "install", "-y", "ripgrep"]).returncode == 0
+            if shutil.which("yum"):
+                return subprocess.run(["sudo", "yum", "install", "-y", "ripgrep"]).returncode == 0
+            if shutil.which("pacman"):
+                return subprocess.run(["sudo", "pacman", "-S", "--noconfirm", "ripgrep"]).returncode == 0
+            if shutil.which("snap"):
+                return subprocess.run(["sudo", "snap", "install", "ripgrep"]).returncode == 0
+        if system == "Windows" and shutil.which("winget"):
+            return subprocess.run(["winget", "install", "--id", "BurntSushi.ripgrep.MSVC"]).returncode == 0
+    except (subprocess.CalledProcessError, OSError):
+        return False
+    return False
+
+
+def ensure_rg_ready(skip: bool = False) -> None:
+    """The deep scan locates symbol references via ripgrep; make sure it is on
+    PATH before relying on it (same self-setup contract as ensure_gh_ready)."""
+    if skip or shutil.which("rg"):
+        return
+    print("[setup] ripgrep ('rg') not found — attempting to install it...",
+          file=sys.stderr)
+    if not (_install_rg() and shutil.which("rg")):
+        raise SystemExit(
+            "Could not auto-install ripgrep for this platform. "
+            "Install it manually: https://github.com/BurntSushi/ripgrep "
+            "then re-run."
+        )
+
 # ---------------------------------------------------------------------------
 # Service map: path prefix -> area. In the platform monorepo a submodule bump
 # (a one-line gitlink diff) means "this sub-service changed"; a path under a
@@ -1363,12 +1403,16 @@ def render_markdown(plan: dict, pr: dict, repo: str) -> str:
                  "Approve or Request Changes.")
     lines.append("")
 
-    lines.append("<details><summary>Changed files</summary>")
-    lines.append("")
-    for f in sorted(plan["areas"].get("(unknown / other)", {}).get("files", [])):
-        lines.append(f"- `{f}`")
-    lines.append("</details>")
-    lines.append("")
+    all_changed = sorted(
+        f for area in plan["areas"].values() for f in area.get("files", [])
+    )
+    if all_changed:
+        lines.append("<details><summary>Changed files</summary>")
+        lines.append("")
+        for f in all_changed:
+            lines.append(f"- `{f}`")
+        lines.append("</details>")
+        lines.append("")
 
     # Wrap-up — last step, not a Phase 2 setup note, so the guided
     # walkthrough presents it after everything else instead of right after
@@ -1377,6 +1421,8 @@ def render_markdown(plan: dict, pr: dict, repo: str) -> str:
     lines.append("")
     lines.append("- Tear down: `docker compose -f docker-compose.dev.yml down` "
                  "— don't leave stacks running between PRs.")
+    
+    return "\n".join(lines)
     return "\n".join(lines)
 
 
@@ -1850,7 +1896,10 @@ def rg_files(repo_path: str, pattern: str, extra_globs: list[str] | None = None)
         for g in extra_globs:
             cmd.append("-g")
             cmd.append(g)
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError:
+        return []
     if r.returncode not in (0, 1):
         return []
     return [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
@@ -3131,7 +3180,13 @@ def run_interactive_report(md: str, export_path: str, deep: dict | None = None) 
 def resolve_pr(repo: str, pr_arg: str | None) -> int:
     if pr_arg:
         return int(pr_arg)
-    result = gh("pr", "view", "--repo", repo, "--json", "number", "--jq", ".number")
+    # `gh pr view --repo` refuses to infer the PR from the checked-out branch,
+    # so pass the branch explicitly (falls back to bare invocation outside a
+    # git worktree, which then fails with the same message as before).
+    branch = subprocess.run(["git", "branch", "--show-current"],
+                            capture_output=True, text=True).stdout.strip()
+    result = gh("pr", "view", *([branch] if branch else []),
+                "--repo", repo, "--json", "number", "--jq", ".number")
     if result.returncode == 0 and result.stdout.strip():
         return int(result.stdout.strip())
     raise SystemExit(f"No --pr given and no PR is open for the current branch in {repo}.")
@@ -3180,6 +3235,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def run_plan(args) -> None:
+    if args.deep:
+        ensure_rg_ready(skip=args.skip_setup)
+
     if not args.repo:
         with Spinner("Detecting current repo..."):
             r = gh("repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner")
