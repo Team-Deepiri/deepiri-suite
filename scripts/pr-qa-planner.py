@@ -403,9 +403,10 @@ def detect_native_package_manager() -> str | None:
     if from_state:
         return from_state
     info = read_os_release()
-    ident = f"{info.get('ID', '')} {info.get('ID_LIKE', '')}".lower()
+    tokens = {info.get("ID", "").lower()}
+    tokens.update(info.get("ID_LIKE", "").lower().split())
     for family, manager in _DISTRO_FAMILY_MANAGER.items():
-        if family in ident:
+        if family in tokens:
             return manager
     return None
 
