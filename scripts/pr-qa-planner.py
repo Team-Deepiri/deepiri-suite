@@ -267,7 +267,7 @@ def install_from_github_release(gh_repo: str, binary_name: str, dest_dir: str | 
     except (urllib.error.URLError, OSError, json.JSONDecodeError, TimeoutError):
         return False
     asset = _pick_release_asset(release.get("assets", []))
-    if not asset:
+    if not asset or "browser_download_url" not in asset:
         return False
     try:
         req = urllib.request.Request(asset["browser_download_url"],
