@@ -494,6 +494,28 @@ def install_via_package_manager(pkg_names: dict[str, str], timeout: int = 180) -
     return False
 
 
+def _install_gh_via_apt() -> bool:
+    """Add the official GitHub CLI apt source and install gh. Apt's default
+    repos don't carry gh on some releases — this adds the official source
+    per https://cli.github.com/ and retries."""
+    if not shutil.which("apt-get"):
+        return False
+    setup = (
+        "curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg "
+        "| sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg && "
+        "sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg && "
+        'echo "deb [arch=$(dpkg --print-architecture) '
+        "signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] "
+        'https://cli.github.com/packages stable main" | '
+        "sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null && "
+        "sudo apt-get update && sudo apt-get install -y gh"
+    )
+    try:
+        return subprocess.run(["bash", "-c", setup], timeout=180).returncode == 0
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+
+
 def _install_gh() -> bool:
     """Install the gh CLI. Tries the official prebuilt binary release first
     (no package-manager guessing needed at all), then falls back to
@@ -505,24 +527,7 @@ def _install_gh() -> bool:
     pkg_name = resolve_package_name_for_this_machine("github-cli", "gh")
     if install_via_package_manager({m: pkg_name for m, _ in PACKAGE_MANAGERS}):
         return True
-    # apt's default repos don't carry `gh` on some releases — add the
-    # official apt source (per https://cli.github.com/) and retry.
-    if shutil.which("apt-get"):
-        setup = (
-            "curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg "
-            "| sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg && "
-            "sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg && "
-            'echo "deb [arch=$(dpkg --print-architecture) '
-            "signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] "
-            'https://cli.github.com/packages stable main" | '
-            "sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null && "
-            "sudo apt-get update && sudo apt-get install -y gh"
-        )
-        try:
-            return subprocess.run(["bash", "-c", setup], timeout=180).returncode == 0
-        except (subprocess.TimeoutExpired, OSError):
-            return False
-    return False
+    return _install_gh_via_apt()
 
 
 def _install_rg() -> bool:
