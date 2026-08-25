@@ -253,27 +253,37 @@ def _pick_release_asset(assets: list[dict]) -> dict | None:
     return candidates[0] if candidates else None
 
 
+def _fetch_url(url: str, headers: dict | None = None, timeout: int = 15) -> bytes | None:
+    """Low-level HTTP GET. Returns the response body as bytes, or None on
+    any network/parse error. Callers decode JSON/text as needed."""
+    try:
+        req = urllib.request.Request(url, headers=headers or {})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read()
+    except (urllib.error.URLError, OSError, TimeoutError):
+        return None
+
+
 def _fetch_github_release(gh_repo: str) -> dict | None:
     """Fetch the latest release metadata for a GitHub repo."""
+    blob = _fetch_url(
+        f"https://api.github.com/repos/{gh_repo}/releases/latest",
+        headers={"User-Agent": "pr-qa-planner", "Accept": "application/vnd.github+json"})
+    if not blob:
+        return None
     try:
-        req = urllib.request.Request(
-            f"https://api.github.com/repos/{gh_repo}/releases/latest",
-            headers={"User-Agent": "pr-qa-planner", "Accept": "application/vnd.github+json"})
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            return json.loads(resp.read().decode())
-    except (urllib.error.URLError, OSError, json.JSONDecodeError, TimeoutError):
+        return json.loads(blob.decode())
+    except json.JSONDecodeError:
         return None
 
 
 def _download_asset(asset: dict) -> bytes | None:
     """Download a release asset's bytes. Returns None on failure."""
     try:
-        req = urllib.request.Request(asset["browser_download_url"],
-                                     headers={"User-Agent": "pr-qa-planner"})
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            return resp.read()
-    except (urllib.error.URLError, OSError, TimeoutError, KeyError):
+        url = asset["browser_download_url"]
+    except KeyError:
         return None
+    return _fetch_url(url, headers={"User-Agent": "pr-qa-planner"}, timeout=120)
 
 
 def _extract_archive(blob: bytes, asset_name: str, dest: str) -> bool:
@@ -477,13 +487,14 @@ def resolve_package_name_for_this_machine(repology_project: str, fallback: str) 
     hint = repology_repo_hint()
     if not hint:
         return fallback
+    blob = _fetch_url(
+        f"https://repology.org/api/v1/project/{repology_project}",
+        headers={"User-Agent": "pr-qa-planner (github.com/Team-Deepiri/deepiri-suite)"})
+    if not blob:
+        return fallback
     try:
-        req = urllib.request.Request(
-            f"https://repology.org/api/v1/project/{repology_project}",
-            headers={"User-Agent": "pr-qa-planner (github.com/Team-Deepiri/deepiri-suite)"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            entries = json.loads(resp.read().decode())
-    except (urllib.error.URLError, OSError, json.JSONDecodeError, TimeoutError):
+        entries = json.loads(blob.decode())
+    except json.JSONDecodeError:
         return fallback
     for entry in entries:
         if hint in entry.get("repo", "").lower():
@@ -814,14 +825,12 @@ def fetch_linguist_extension_map() -> dict[str, str]:
     global _LINGUIST_MAP
     if _LINGUIST_MAP is not None:
         return _LINGUIST_MAP
-    try:
-        req = urllib.request.Request(LINGUIST_LANGUAGES_URL,
-                                     headers={"User-Agent": "pr-qa-planner"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            text = resp.read().decode("utf-8", errors="replace")
-    except (urllib.error.URLError, OSError, TimeoutError):
+    blob = _fetch_url(LINGUIST_LANGUAGES_URL,
+                       headers={"User-Agent": "pr-qa-planner"})
+    if not blob:
         _LINGUIST_MAP = {}
         return _LINGUIST_MAP
+    text = blob.decode("utf-8", errors="replace")
     mapping: dict[str, str] = {}
     current_lang = None
     current_is_programming = False
