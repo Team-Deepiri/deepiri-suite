@@ -459,6 +459,9 @@ def repology_repo_hint() -> str | None:
     return (read_os_release().get("ID") or "").lower() or None
 
 
+_REPOLOGY_CACHE: dict[str, str] = {}
+
+
 def resolve_package_name_for_this_machine(repology_project: str, fallback: str) -> str:
     """What `repology_project` is actually called in the ONE package repo
     this specific machine uses, per repology.org's public API (a live
@@ -469,6 +472,8 @@ def resolve_package_name_for_this_machine(repology_project: str, fallback: str) 
     so there's no per-manager table to maintain. Falls back to
     `fallback` (the project's own plain name) if repology is unreachable
     or has no entry for this machine's repo."""
+    if repology_project in _REPOLOGY_CACHE:
+        return _REPOLOGY_CACHE[repology_project]
     hint = repology_repo_hint()
     if not hint:
         return fallback
@@ -490,6 +495,7 @@ def resolve_package_name_for_this_machine(repology_project: str, fallback: str) 
             name = (binnames[0] if binnames else None) or \
                 entry.get("srcname") or entry.get("visiblename")
             if name:
+                _REPOLOGY_CACHE[repology_project] = name
                 return name
     return fallback
 
