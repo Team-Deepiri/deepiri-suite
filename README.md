@@ -55,6 +55,22 @@ python3 scripts/pr-qa-planner.py --review-check --sweep --repo Team-Deepiri/deep
 python3 scripts/pr-qa-planner.py --review-check --sweep --all-repos --limit 30
 ```
 
+**Interactive terminal report** — run with `--interactive` (or with no
+arguments on a TTY) to open the plan in a scrollable terminal UI instead of
+static markdown: `↑/↓` or `j/k` move, `space` toggles checklist items,
+`e` exports the current state to a file, `c` copies the whole report,
+`l` copies just the cursor line's command, and `p` builds an AI-prompt
+bundle (plan + deep-scan context). Copying uses OSC 52 — the terminal
+itself sets the clipboard — so it works over SSH and inside tmux without
+xclip/wl-copy/pbcopy installed.
+
+**Guided walkthrough** — press `w` in the interactive report to step
+through every actionable line one at a time, navigated with `←`/`→`: run a
+step's command inline with `r` (output shown in the same terminal), open
+visual-check URLs with `o`, tick checkboxes with `space`. Every step of the
+plan is included — health checks, per-area test commands, per-route curls,
+and the individual backend functions this PR changed.
+
 See the module docstring for the full option list.
 
 Images are published to **GitHub Container Registry**:
