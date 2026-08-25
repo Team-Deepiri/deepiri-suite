@@ -280,12 +280,15 @@ def install_from_github_release(gh_repo: str, binary_name: str, dest_dir: str | 
     target_name = binary_name + (".exe" if platform.system() == "Windows" else "")
     with tempfile.TemporaryDirectory() as tmp:
         try:
-            if asset["name"].endswith(".zip"):
+            name_lower = asset["name"].lower()
+            if name_lower.endswith(".zip"):
                 with zipfile.ZipFile(io.BytesIO(blob)) as zf:
                     zf.extractall(tmp)
-            else:
+            elif name_lower.endswith((".tar.gz", ".tgz")):
                 with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tf:
                     tf.extractall(tmp)
+            else:
+                return False
         except (zipfile.BadZipFile, tarfile.TarError, OSError):
             return False
         found = None
