@@ -253,62 +253,90 @@ def _pick_release_asset(assets: list[dict]) -> dict | None:
     return candidates[0] if candidates else None
 
 
-def install_from_github_release(gh_repo: str, binary_name: str, dest_dir: str | None = None) -> bool:
-    """Fetch the latest release of `gh_repo` and install whichever binary
-    inside matches `binary_name` for this OS/arch. Uses urllib directly
-    (not the `gh` CLI) since this may be called to install `gh` itself."""
-    dest_dir = dest_dir or os.path.join(os.path.expanduser("~"), ".local", "bin")
+def _fetch_github_release(gh_repo: str) -> dict | None:
+    """Fetch the latest release metadata for a GitHub repo."""
     try:
         req = urllib.request.Request(
             f"https://api.github.com/repos/{gh_repo}/releases/latest",
             headers={"User-Agent": "pr-qa-planner", "Accept": "application/vnd.github+json"})
         with urllib.request.urlopen(req, timeout=15) as resp:
-            release = json.loads(resp.read().decode())
+            return json.loads(resp.read().decode())
     except (urllib.error.URLError, OSError, json.JSONDecodeError, TimeoutError):
-        return False
-    asset = _pick_release_asset(release.get("assets", []))
-    if not asset or "browser_download_url" not in asset:
-        return False
+        return None
+
+
+def _download_asset(asset: dict) -> bytes | None:
+    """Download a release asset's bytes. Returns None on failure."""
     try:
         req = urllib.request.Request(asset["browser_download_url"],
                                      headers={"User-Agent": "pr-qa-planner"})
         with urllib.request.urlopen(req, timeout=120) as resp:
-            blob = resp.read()
-    except (urllib.error.URLError, OSError, TimeoutError):
-        return False
+            return resp.read()
+    except (urllib.error.URLError, OSError, TimeoutError, KeyError):
+        return None
 
+
+def _extract_archive(blob: bytes, asset_name: str, dest: str) -> bool:
+    """Extract a .zip, .tar.gz, or .tgz archive into dest. Returns False
+    on unsupported format or extraction error."""
+    name_lower = asset_name.lower()
+    try:
+        if name_lower.endswith(".zip"):
+            with zipfile.ZipFile(io.BytesIO(blob)) as zf:
+                zf.extractall(dest)
+        elif name_lower.endswith((".tar.gz", ".tgz")):
+            with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tf:
+                tf.extractall(dest)
+        else:
+            return False
+    except (zipfile.BadZipFile, tarfile.TarError, OSError):
+        return False
+    return True
+
+
+def _find_and_install_binary(source_dir: str, binary_name: str,
+                             dest_dir: str) -> bool:
+    """Walk source_dir to find binary_name, copy it to dest_dir, and make
+    it executable. Returns False if the binary isn't found or install fails."""
     target_name = binary_name + (".exe" if platform.system() == "Windows" else "")
-    with tempfile.TemporaryDirectory() as tmp:
-        try:
-            name_lower = asset["name"].lower()
-            if name_lower.endswith(".zip"):
-                with zipfile.ZipFile(io.BytesIO(blob)) as zf:
-                    zf.extractall(tmp)
-            elif name_lower.endswith((".tar.gz", ".tgz")):
-                with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tf:
-                    tf.extractall(tmp)
-            else:
-                return False
-        except (zipfile.BadZipFile, tarfile.TarError, OSError):
-            return False
-        found = None
-        for dirpath, _dirs, filenames in os.walk(tmp):
-            if target_name in filenames:
-                found = os.path.join(dirpath, target_name)
-                break
-        if not found:
-            return False
-        os.makedirs(dest_dir, exist_ok=True)
-        dest_path = os.path.join(dest_dir, target_name)
-        try:
-            shutil.copy2(found, dest_path)
-            os.chmod(dest_path, 0o755)
-        except OSError:
-            return False
+    found = None
+    for dirpath, _dirs, filenames in os.walk(source_dir):
+        if target_name in filenames:
+            found = os.path.join(dirpath, target_name)
+            break
+    if not found:
+        return False
+    os.makedirs(dest_dir, exist_ok=True)
+    dest_path = os.path.join(dest_dir, target_name)
+    try:
+        shutil.copy2(found, dest_path)
+        os.chmod(dest_path, 0o755)
+    except OSError:
+        return False
     if dest_dir not in os.environ.get("PATH", "").split(os.pathsep):
         print(f"[setup] installed to {dest_path} — add {dest_dir} to your PATH "
               "if this isn't picked up automatically.", file=sys.stderr)
     return shutil.which(target_name) is not None or os.path.isfile(dest_path)
+
+
+def install_from_github_release(gh_repo: str, binary_name: str, dest_dir: str | None = None) -> bool:
+    """Fetch the latest release of `gh_repo` and install whichever binary
+    inside matches `binary_name` for this OS/arch. Uses urllib directly
+    (not the `gh` CLI) since this may be called to install `gh` itself."""
+    dest_dir = dest_dir or os.path.join(os.path.expanduser("~"), ".local", "bin")
+    release = _fetch_github_release(gh_repo)
+    if not release:
+        return False
+    asset = _pick_release_asset(release.get("assets", []))
+    if not asset or "browser_download_url" not in asset:
+        return False
+    blob = _download_asset(asset)
+    if not blob:
+        return False
+    with tempfile.TemporaryDirectory() as tmp:
+        if not _extract_archive(blob, asset["name"], tmp):
+            return False
+        return _find_and_install_binary(tmp, binary_name, dest_dir)
 
 
 # One generic package-manager table shared by every auto-installer in this
