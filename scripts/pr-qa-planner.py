@@ -565,28 +565,13 @@ def _install_gh() -> bool:
 
 
 def _install_rg() -> bool:
-    """Best-effort install of ripgrep via the current platform's package
-    manager, mirroring the fallback cascade used for gh above."""
-    system = platform.system()
-    try:
-        if system == "Darwin" and shutil.which("brew"):
-            return subprocess.run(["brew", "install", "ripgrep"]).returncode == 0
-        if system == "Linux":
-            if shutil.which("apt-get"):
-                return subprocess.run(["sudo", "apt-get", "install", "-y", "ripgrep"]).returncode == 0
-            if shutil.which("dnf"):
-                return subprocess.run(["sudo", "dnf", "install", "-y", "ripgrep"]).returncode == 0
-            if shutil.which("yum"):
-                return subprocess.run(["sudo", "yum", "install", "-y", "ripgrep"]).returncode == 0
-            if shutil.which("pacman"):
-                return subprocess.run(["sudo", "pacman", "-S", "--noconfirm", "ripgrep"]).returncode == 0
-            if shutil.which("snap"):
-                return subprocess.run(["sudo", "snap", "install", "ripgrep"]).returncode == 0
-        if system == "Windows" and shutil.which("winget"):
-            return subprocess.run(["winget", "install", "--id", "BurntSushi.ripgrep.MSVC"]).returncode == 0
-    except (subprocess.CalledProcessError, OSError):
-        return False
-    return False
+    """Best-effort install of ripgrep via the official GitHub release
+    first, then falling back to whichever package manager the current
+    platform has — same pattern as _install_gh."""
+    if install_from_github_release("BurntSushi/ripgrep", "rg"):
+        return True
+    pkg_name = resolve_package_name_for_this_machine("ripgrep", "ripgrep")
+    return install_via_package_manager({m: pkg_name for m, _ in PACKAGE_MANAGERS})
 
 
 def ensure_rg_ready(skip: bool = False) -> None:
