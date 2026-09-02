@@ -13,7 +13,7 @@ platform's package manager if it's missing, then runs `gh auth login` if
 you're not authenticated. Nothing else to install — stdlib only.
 
 **Test planning** — including submodule-bump PRs against the
-`deepiri-platform` monorepo:
+`deepiri-platform` (cloud) or `deepiri-control-plane` (local/lab) monorepo:
 
 ```bash
 # Local analysis
@@ -31,7 +31,7 @@ python3 scripts/pr-qa-planner.py --repo Team-Deepiri/deepiri-platform --pr 316 -
 
 The plan follows the `deepiri-qa-workflow` skill: task identification
 (Plaky/inbox/cross-PR deps/submodule-bump commits), environment bring-up via
-the consolidated `setup-deepiri-dev.sh --team qa` script (adds `--build`
+the consolidated `setup-deepiri-dev.sh --team qa` script (in **deepiri-control-plane**) (adds `--build`
 automatically when the PR touches lockfiles/Dockerfiles/submodule pointers),
 health check + `/sorge` first pass, frontend/backend verification, and the
 review-submission rule (Approve or Request Changes, never Comment-only).
@@ -113,7 +113,7 @@ In GitHub Actions, use `docker/login-action` with `registry: ghcr.io` and `GITHU
 - `/usr/local/bin/docker-entrypoint.sh` — sources the loader then `exec`s the container command
 - `/usr/local/bin/prisma-baseline.sh` — optional Prisma baseline helper
 
-Source of truth for script content is this repo; sync from `deepiri-platform` `platform-services/shared/scripts/` when those files change.
+Source of truth for script content is this repo; sync from `deepiri-control-plane` (or platform) `platform-services/shared/scripts/` when those files change.
 
 ## Child Dockerfiles
 

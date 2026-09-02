@@ -7,7 +7,7 @@ repo + PR, it:
 
   1. Fetches the PR metadata and changed-file list via the GitHub API (gh).
   2. Maps every changed path to an affected service/area (including submodule
-     bumps in the deepiri-platform monorepo).
+     bumps in the deepiri-control-plane monorepo).
   3. Flags risk signals: Dockerfile changes, lockfile/dependency churn,
      DB migrations, CI workflow edits, secrets/env changes, and changes that
      ship without any accompanying test.
